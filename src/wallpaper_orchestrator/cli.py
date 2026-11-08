@@ -7,7 +7,11 @@ from wallpaper_orchestrator import __version__
 
 from pathlib import Path
 
-from wallpaper_orchestrator.library import find_images, get_image_orientation, infer_theme
+from wallpaper_orchestrator.library import find_images, get_image_orientation, infer_theme, load_wallpapers
+
+from wallpaper_orchestrator.models import Monitor
+
+from wallpaper_orchestrator.selector import choose_wallpaper
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,9 +42,52 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to the wallpaper folder.",
     )
 
+    
+    suggest_parser = subparsers.add_parser(
+        "suggest",
+        help="Randomly suggest a wallpaper for an orientation.",
+    )
+
+    suggest_parser.add_argument(
+        "folder",
+        type=Path,
+        help="Root directory of the wallpaper collection.",
+    )
+
+    suggest_parser.add_argument(
+        "--orientation",
+        choices=["portrait", "landscape", "square"],
+        required=True,
+        help="Required wallpaper orientation.",
+    )
+
+
 
     
     args = parser.parse_args(argv)
+
+    
+    if args.command == "suggest":
+        try:
+            wallpapers = load_wallpapers(args.folder)
+
+            monitor = Monitor(
+                role="preview",
+                orientation=args.orientation,
+            )
+
+            selected = choose_wallpaper(monitor, wallpapers)
+
+        except ValueError as error:
+            parser.error(str(error))
+
+        print(f"Selected wallpaper: {selected.path}")
+        print(f"Orientation: {selected.orientation}")
+        print(f"Themes: {', '.join(sorted(selected.themes))}")
+
+        return 0
+
+
 
     if args.command == "scan":
         try:
