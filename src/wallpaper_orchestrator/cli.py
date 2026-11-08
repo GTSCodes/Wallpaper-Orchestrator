@@ -7,7 +7,7 @@ from wallpaper_orchestrator import __version__
 
 from pathlib import Path
 
-from wallpaper_orchestrator.library import find_images
+from wallpaper_orchestrator.library import find_images, get_image_orientation
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,8 +50,21 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"Found {len(images)} wallpaper(s):")
 
+        
         for image in images:
-            print(f"  {image.relative_to(args.folder)}")
+            try:
+                width, height, orientation = get_image_orientation(image)
+            except OSError as error:
+                print(f"  Could not read {image.name}: {error}")
+                continue
+
+            relative_path = image.relative_to(args.folder)
+
+            print(
+                f"  [{orientation:9}] "
+                f"{width}x{height}  {relative_path}"
+            )
+
 
         return 0
 

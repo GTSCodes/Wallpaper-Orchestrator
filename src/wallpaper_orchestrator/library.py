@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+from PIL import Image
+
 
 SUPPORTED_EXTENSIONS = {
     ".jpg",
@@ -11,6 +13,22 @@ SUPPORTED_EXTENSIONS = {
     ".bmp",
     ".webp",
 }
+
+
+def get_image_orientation(path: Path) -> tuple[int, int, str]:
+    """Return an image's width, height and orientation."""
+
+    with Image.open(path) as image:
+        width, height = image.size
+
+    if width > height:
+        orientation = "landscape"
+    elif height > width:
+        orientation = "portrait"
+    else:
+        orientation = "square"
+
+    return width, height, orientation
 
 
 def find_images(folder: Path) -> list[Path]:
