@@ -82,11 +82,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Found {len(monitors)} active monitor(s):")
 
         for index, monitor in enumerate(monitors, start=1):
+            
             print(
                 f"{index}. "
                 f"{monitor.width}x{monitor.height} "
-                f"— {monitor.orientation}"
+                f"— {monitor.orientation} "
+                f"— position ({monitor.x}, {monitor.y})"
             )
+
 
         return 0
 
