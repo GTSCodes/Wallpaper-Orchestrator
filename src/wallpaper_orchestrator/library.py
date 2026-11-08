@@ -31,6 +31,18 @@ def get_image_orientation(path: Path) -> tuple[int, int, str]:
     return width, height, orientation
 
 
+def infer_theme(image_path: Path, library_root: Path) -> str:
+    """Infer an image's theme from its containing folder."""
+
+    relative_path = image_path.relative_to(library_root)
+
+    if len(relative_path.parts) == 1:
+        return "untagged"
+
+    return relative_path.parent.name
+
+
+
 def find_images(folder: Path) -> list[Path]:
     """Find supported images in a folder and its subfolders."""
 

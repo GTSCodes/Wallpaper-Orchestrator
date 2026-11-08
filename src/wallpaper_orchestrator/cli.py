@@ -7,7 +7,7 @@ from wallpaper_orchestrator import __version__
 
 from pathlib import Path
 
-from wallpaper_orchestrator.library import find_images, get_image_orientation
+from wallpaper_orchestrator.library import find_images, get_image_orientation, infer_theme
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,10 +60,16 @@ def main(argv: list[str] | None = None) -> int:
 
             relative_path = image.relative_to(args.folder)
 
+            theme = infer_theme(image, args.folder)
+
+            
             print(
                 f"  [{orientation:9}] "
-                f"{width}x{height}  {relative_path}"
+                f"{width}x{height} "
+                f"[{theme}] "
+                f"{relative_path}"
             )
+
 
 
         return 0
