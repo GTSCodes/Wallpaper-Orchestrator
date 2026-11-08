@@ -1,0 +1,19 @@
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wallpaper-orchestrator"
+version = "0.0.0"
+description = "A configurable, cross-platform multi-monitor wallpaper manager"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+    { name = "GTSCodes" }
+]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
