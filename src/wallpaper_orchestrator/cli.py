@@ -1,7 +1,7 @@
 
 """Command-line interface for Wallpaper Orchestrator."""
 
-import argparse
+import argparse, sys
 
 from wallpaper_orchestrator import __version__
 
@@ -30,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
 
     
     subparsers = parser.add_subparsers(dest="command")
+
+    
 
     scan_parser = subparsers.add_parser(
         "scan",
@@ -61,10 +63,33 @@ def main(argv: list[str] | None = None) -> int:
         help="Required wallpaper orientation.",
     )
 
+    subparsers.add_parser(
+            "monitors",
+            help="List connected Windows monitors.",
+    )
 
+    args = parser.parse_args(argv)
 
     
-    args = parser.parse_args(argv)
+    if args.command == "monitors":
+        if sys.platform != "win32":
+            parser.error("Monitor discovery currently requires Windows.")
+
+        from wallpaper_orchestrator.platforms.windows import discover_monitors
+
+        monitors = discover_monitors()
+
+        print(f"Found {len(monitors)} active monitor(s):")
+
+        for index, monitor in enumerate(monitors, start=1):
+            print(
+                f"{index}. "
+                f"{monitor.width}x{monitor.height} "
+                f"— {monitor.orientation}"
+            )
+
+        return 0
+
 
     
     if args.command == "suggest":
