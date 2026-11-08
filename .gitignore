@@ -1,0 +1,28 @@
+
+# Python virtual environment
+.venv/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Testing and formatting caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+
+# Personal wallpaper collections and configuration
+/wallpapers/
+/Wallpapers/
+/user-data/
+*.local.json
+*.local.toml
