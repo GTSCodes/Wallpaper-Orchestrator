@@ -20,11 +20,15 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QComboBox,
 )
 
 from wallpaper_orchestrator.platforms.windows import discover_monitors, set_monitor_wallpaper
 from wallpaper_orchestrator.state import load_monitor_mapping
 from wallpaper_orchestrator.engine import create_plan, apply_plan
+from wallpaper_orchestrator.library import load_wallpapers
+from wallpaper_orchestrator.models import Monitor
+from wallpaper_orchestrator.selector import choose_wallpaper
 
 
 class MonitorView(QGraphicsView):
@@ -64,11 +68,26 @@ class WallpaperWindow(QMainWindow):
             "color: white; font-size: 15px; padding: 12px;"
         )
 
+        self.mode_label = QLabel("Wallpaper behaviour:")
+        self.mode_label.setStyleSheet("color: white;")
+
+        self.mode_selector = QComboBox()
+
+        self.mode_selector.addItems([
+            "Fixed Image",
+            "Random Folder",
+            "Coordinated",
+        ])
+
+        self.mode_selector.setEnabled(False)
+
         container = QWidget()
         layout = QVBoxLayout(container)
 
         layout.addWidget(self.view, stretch=1)
         layout.addWidget(self.info)
+        layout.addWidget(self.mode_label)
+        layout.addWidget(self.mode_selector)
         # Wallpaper selection controls
         self.image_path = QLineEdit()
         self.image_path.setPlaceholderText("Select a wallpaper image...")
@@ -79,6 +98,16 @@ class WallpaperWindow(QMainWindow):
 
         self.apply_button = QPushButton("Apply Wallpaper")
         self.apply_button.clicked.connect(self.apply_wallpaper)
+
+        self.shuffle_selected_button = QPushButton("Shuffle Selected Monitor")
+
+        self.shuffle_selected_button.clicked.connect(
+            self.shuffle_selected
+        )
+
+        self.shuffle_selected_button.setEnabled(False)
+
+        layout.addWidget(self.shuffle_selected_button)
 
         # A monitor must be selected before applying.
         self.apply_button.setEnabled(False)
@@ -198,13 +227,16 @@ class WallpaperWindow(QMainWindow):
         )
 
     def monitor_selected(self):
-        """Update the interface when a monitor is clicked."""
+        """Update controls when a monitor is selected."""
+
         self.selected_device_id = None
+
+        # Reset controls.
         self.apply_button.setEnabled(False)
+        self.mode_selector.setEnabled(False)
+        self.shuffle_selected_button.setEnabled(False)
 
         for item in self.scene.items():
-            if not isinstance(item, QGraphicsItem):
-                continue
 
             if not item.data(1):
                 continue
@@ -213,8 +245,12 @@ class WallpaperWindow(QMainWindow):
                 item.setPen(QPen(QColor("#45a3ff"), 16))
 
                 role = item.data(0)
+
                 self.selected_device_id = item.data(1)
+
                 self.apply_button.setEnabled(True)
+                self.mode_selector.setEnabled(True)
+                self.shuffle_selected_button.setEnabled(True)
 
                 self.info.setText(
                     f"Selected monitor: {role}"
@@ -222,6 +258,11 @@ class WallpaperWindow(QMainWindow):
 
             else:
                 item.setPen(QPen(QColor("#718096"), 12))
+
+        if self.selected_device_id is None:
+            self.info.setText(
+                "Select a monitor to configure it."
+            )
     def browse_wallpaper(self):
         """Let the user select a wallpaper image."""
 
@@ -338,6 +379,87 @@ class WallpaperWindow(QMainWindow):
 
         self.info.setText(
             f"Wallpaper applied successfully: {image.name}"
+        )
+
+    def shuffle_selected(self):
+        """Shuffle the selected monitor using its chosen mode."""
+
+        if not self.selected_device_id:
+            return
+
+        mode = self.mode_selector.currentText()
+
+        if mode == "Fixed Image":
+            self.apply_wallpaper()
+            return
+
+        if mode == "Coordinated":
+            self.shuffle_all()
+            return
+
+        folder = Path(self.folder_path.text())
+
+        if not folder.is_dir():
+            QMessageBox.warning(
+                self,
+                "Folder Required",
+                "Please choose a wallpaper library folder.",
+            )
+            return
+
+        detected = next(
+            (
+                monitor
+                for monitor in self.monitors
+                if monitor.device_id == self.selected_device_id
+            ),
+            None,
+        )
+
+        if detected is None:
+            QMessageBox.critical(
+                self,
+                "Monitor Unavailable",
+                "The selected monitor is no longer active.",
+            )
+            return
+
+        try:
+            wallpapers = load_wallpapers(folder)
+
+            compatible = [
+                wallpaper
+                for wallpaper in wallpapers
+                if wallpaper.path.suffix.lower()
+                in {".jpg", ".jpeg", ".png", ".bmp"}
+                and wallpaper.path.is_file()
+            ]
+
+            monitor = Monitor(
+                role="selected",
+                orientation=detected.orientation,
+            )
+
+            chosen = choose_wallpaper(
+                monitor,
+                compatible,
+            )
+
+            set_monitor_wallpaper(
+                self.selected_device_id,
+                chosen.path,
+            )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Shuffle Error",
+                str(error),
+            )
+            return
+
+        self.info.setText(
+            f"Wallpaper shuffled: {chosen.path.name}"
         )
 
 
