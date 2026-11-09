@@ -4,7 +4,7 @@ import sys
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, QSettings
 from PySide6.QtGui import QColor, QBrush, QPen, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -49,6 +49,10 @@ class WallpaperWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.settings = QSettings(
+        "WallpaperOrchestrator",
+        "WallpaperOrchestrator",
+    )
 
         self.setWindowTitle("Wallpaper Orchestrator")
         self.resize(1000, 650)
@@ -125,6 +129,15 @@ class WallpaperWindow(QMainWindow):
             "Choose your wallpaper library folder..."
         )
         self.folder_path.setReadOnly(True)
+        # Restore the previously selected wallpaper folder.
+        saved_folder = self.settings.value(
+            "wallpaper_library",
+            "",
+            type=str,
+        )
+
+        if saved_folder and Path(saved_folder).is_dir():
+            self.folder_path.setText(saved_folder)
 
         self.folder_button = QPushButton("Choose Folder")
         self.folder_button.clicked.connect(self.browse_folder)
@@ -277,16 +290,24 @@ class WallpaperWindow(QMainWindow):
             self.image_path.setText(filename)
 
     def browse_folder(self):
-        """Select the wallpaper library."""
+        """Select and remember the wallpaper library."""
 
         folder = QFileDialog.getExistingDirectory(
             self,
             "Choose Wallpaper Library",
+            self.folder_path.text(),
         )
 
         if folder:
             self.folder_path.setText(folder)
 
+            # Remember this folder across application launches.
+            self.settings.setValue(
+                "wallpaper_library",
+                folder,
+            )
+
+            self.settings.sync()
 
     def shuffle_all(self):
         """Preview and optionally apply coordinated wallpapers."""
