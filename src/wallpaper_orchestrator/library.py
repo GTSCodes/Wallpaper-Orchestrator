@@ -7,6 +7,11 @@ from PIL import Image
 
 from wallpaper_orchestrator.models import Orientation, Wallpaper
 
+from wallpaper_orchestrator.config import (
+    load_config,
+    resolve_themes,
+)
+
 
 SUPPORTED_EXTENSIONS = {
     ".jpg",
@@ -66,6 +71,8 @@ def load_wallpapers(folder: Path) -> list[Wallpaper]:
 
     wallpapers = []
 
+    config = load_config()
+
     for path in find_images(folder):
         try:
             _, _, orientation = get_image_orientation(path)
@@ -73,13 +80,15 @@ def load_wallpapers(folder: Path) -> list[Wallpaper]:
             print(f"Skipping unreadable image: {path.name}")
             continue
 
-        theme = infer_theme(path, folder)
+        
+        themes = resolve_themes(path, folder, config)
 
         wallpaper = Wallpaper(
             path=path,
             orientation=orientation,
-            themes=frozenset({theme}),
+            themes=themes,
         )
+
 
         wallpapers.append(wallpaper)
 

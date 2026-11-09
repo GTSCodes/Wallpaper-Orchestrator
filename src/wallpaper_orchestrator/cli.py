@@ -11,7 +11,9 @@ from wallpaper_orchestrator.library import find_images, get_image_orientation, i
 
 from wallpaper_orchestrator.models import Monitor
 
-from wallpaper_orchestrator.selector import choose_wallpaper
+from wallpaper_orchestrator.selector import choose_wallpaper, choose_for_monitors
+
+from wallpaper_orchestrator.config import load_config
 
 from wallpaper_orchestrator.state import (
     load_monitor_mapping,
@@ -103,8 +105,358 @@ def main(argv: list[str] | None = None) -> int:
         help="Actually apply the wallpaper.",
     )
 
+    
+    shuffle_parser = subparsers.add_parser(
+        "shuffle",
+        help="Randomly change a monitor's wallpaper.",
+    )
+
+    shuffle_target = shuffle_parser.add_mutually_exclusive_group(
+        required=True
+    )
+
+    shuffle_target.add_argument(
+        "--monitor",
+        help="Friendly monitor name.",
+    )
+
+    shuffle_target.add_argument(
+        "--all",
+        action="store_true",
+        help="Shuffle all active monitors together.",
+    )
+
+    shuffle_parser.add_argument(
+        "--folder",
+        type=Path,
+        required=True,
+        help="Wallpaper library directory.",
+    )
+
+    shuffle_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the selected wallpaper.",
+    )
+
+    plan_parser = subparsers.add_parser(
+    "plan",
+    help="Preview a coordinated wallpaper combination.",
+    )
+
+    plan_parser.add_argument(
+        "--folder",
+        type=Path,
+        required=True,
+        help="Wallpaper library directory.",
+    )
+
+
 
     args = parser.parse_args(argv)
+
+    
+    if args.command == "plan":
+        if sys.platform != "win32":
+            parser.error("Monitor planning currently requires Windows.")
+
+        from wallpaper_orchestrator.platforms.windows import discover_monitors
+
+        mapping = load_monitor_mapping()
+        config = load_config()
+
+        detected = discover_monitors()
+
+        roles_by_id = {
+            device_id: role
+            for role, device_id in mapping.items()
+        }
+
+        unmapped = [
+            monitor
+            for monitor in detected
+            if monitor.device_id not in roles_by_id
+        ]
+
+        if unmapped:
+            parser.error(
+                f"{len(unmapped)} active monitor(s) have no mapping. "
+                "Run 'wallpaper-orchestrator setup' first."
+            )
+
+        monitors = [
+            Monitor(
+                role=roles_by_id[monitor.device_id],
+                orientation=monitor.orientation,
+            )
+            for monitor in detected
+        ]
+
+        try:
+            wallpapers = load_wallpapers(args.folder)
+
+            supported = [
+                wallpaper
+                for wallpaper in wallpapers
+                if wallpaper.path.suffix.lower()
+                in {".jpg", ".jpeg", ".png", ".bmp"}
+            ]
+
+            limits = config.get("theme_limits", {})
+
+            if not isinstance(limits, dict) or any(
+                not isinstance(theme, str)
+                or type(limit) is not int
+                or limit < 0
+                for theme, limit in limits.items()
+            ):
+                raise ValueError("Invalid theme_limits configuration.")
+
+            assignments = choose_for_monitors(
+                monitors,
+                supported,
+                theme_limits=limits,
+            )
+
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+
+        print("\nWallpaper plan:\n")
+
+        for role, wallpaper in assignments.items():
+            print(f"{role}:")
+            print(f"  Image: {wallpaper.path}")
+            print(f"  Themes: {', '.join(sorted(wallpaper.themes))}")
+            print()
+
+        print("All theme constraints satisfied.")
+        print("No wallpapers changed.")
+
+        return 0
+
+
+    
+    if args.command == "shuffle":
+        if args.all:
+            if sys.platform != "win32":
+                parser.error("Wallpaper shuffling currently requires Windows.")
+
+            from wallpaper_orchestrator.platforms.windows import (
+                discover_monitors,
+                get_monitor_wallpaper,
+                set_monitor_wallpaper,
+            )
+
+            mapping = load_monitor_mapping()
+            config = load_config()
+            detected = discover_monitors()
+
+            roles_by_id = {
+                device_id: role
+                for role, device_id in mapping.items()
+            }
+
+            if any(
+                monitor.device_id not in roles_by_id
+                for monitor in detected
+            ):
+                parser.error(
+                    "An active monitor has no mapping. "
+                    "Run 'wallpaper-orchestrator setup' first."
+                )
+
+            if not detected:
+                parser.error("No active monitors detected.")
+
+            monitors = [
+                Monitor(
+                    role=roles_by_id[monitor.device_id],
+                    orientation=monitor.orientation,
+                )
+                for monitor in detected
+            ]
+
+            try:
+                wallpapers = load_wallpapers(args.folder)
+
+                supported = [
+                    wallpaper
+                    for wallpaper in wallpapers
+                    if wallpaper.path.suffix.lower()
+                    in {".jpg", ".jpeg", ".png", ".bmp"}
+                    and wallpaper.path.is_file()
+                ]
+
+                limits = config.get("theme_limits", {})
+
+                if not isinstance(limits, dict) or any(
+                    not isinstance(theme, str)
+                    or type(limit) is not int
+                    or limit < 0
+                    for theme, limit in limits.items()
+                ):
+                    raise ValueError(
+                        "Invalid theme_limits configuration."
+                    )
+
+                assignments = choose_for_monitors(
+                    monitors,
+                    supported,
+                    theme_limits=limits,
+                )
+
+            except (OSError, ValueError) as error:
+                parser.error(str(error))
+
+            print("\nCoordinated wallpaper selection:\n")
+
+            for role, wallpaper in assignments.items():
+                print(f"{role}: {wallpaper.path}")
+
+            if not args.apply:
+                print("\nDRY RUN — no wallpapers changed.")
+                return 0
+
+            # Save the current wallpapers before applying changes.
+            previous = {}
+
+            try:
+                for monitor in detected:
+                    previous[monitor.device_id] = (
+                        get_monitor_wallpaper(monitor.device_id)
+                    )
+            except Exception as error:
+                parser.error(
+                    f"Could not save current wallpapers: {error}"
+                )
+
+            # Apply the complete plan.
+            changed = []
+
+            try:
+                for monitor in detected:
+                    role = roles_by_id[monitor.device_id]
+                    wallpaper = assignments[role]
+
+                    set_monitor_wallpaper(
+                        monitor.device_id,
+                        wallpaper.path,
+                    )
+
+                    changed.append(monitor.device_id)
+
+            except Exception as error:
+                print(f"\nWallpaper application failed: {error}")
+
+                print("Attempting to restore previous wallpapers...")
+
+                restoration_failed = False
+
+                for device_id in reversed(changed):
+                    old_wallpaper = previous[device_id]
+
+                    if old_wallpaper is None:
+                        restoration_failed = True
+                        print(
+                            "Cannot restore a monitor with "
+                            "no previous wallpaper path."
+                        )
+                        continue
+
+                    try:
+                        set_monitor_wallpaper(
+                            device_id,
+                            old_wallpaper,
+                        )
+                    except Exception as restore_error:
+                        restoration_failed = True
+                        print(
+                            f"Restoration failed: {restore_error}"
+                        )
+
+                if restoration_failed:
+                    print(
+                        "Some wallpapers could not be restored."
+                    )
+                else:
+                    print("Previous wallpapers restored.")
+
+                return 1
+
+            print("\nAll wallpapers applied successfully.")
+            return 0
+
+        if sys.platform != "win32":
+            parser.error("Wallpaper shuffling currently requires Windows.")
+
+        from wallpaper_orchestrator.platforms.windows import (
+            discover_monitors,
+            set_monitor_wallpaper,
+        )
+
+        mapping = load_monitor_mapping()
+
+        if args.monitor not in mapping:
+            parser.error(
+                f"Unknown monitor: {args.monitor}. "
+                "Run 'wallpaper-orchestrator setup' first."
+            )
+
+        device_id = mapping[args.monitor]
+
+        detected = next(
+            (
+                monitor
+                for monitor in discover_monitors()
+                if monitor.device_id == device_id
+            ),
+            None,
+        )
+
+        if detected is None:
+            parser.error(
+                f"Monitor '{args.monitor}' is not currently active."
+            )
+
+        try:
+            wallpapers = load_wallpapers(args.folder)
+
+            supported = [
+                wallpaper
+                for wallpaper in wallpapers
+                if wallpaper.path.suffix.lower()
+                in {".jpg", ".jpeg", ".png", ".bmp"}
+            ]
+
+            logical_monitor = Monitor(
+                role=args.monitor,
+                orientation=detected.orientation,
+            )
+
+            selected = choose_wallpaper(
+                logical_monitor,
+                supported,
+            )
+
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+
+        print(f"Monitor: {args.monitor}")
+        print(f"Selected: {selected.path}")
+        print(f"Theme: {', '.join(sorted(selected.themes))}")
+
+        if not args.apply:
+            print("DRY RUN — no wallpaper changed.")
+            return 0
+
+        try:
+            set_monitor_wallpaper(device_id, selected.path)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+
+        print("Wallpaper shuffled successfully.")
+        return 0
+
 
     
     if args.command == "set":

@@ -136,3 +136,18 @@ def set_monitor_wallpaper(
         device_id,
         str(image_path.resolve()),
     )
+
+def get_monitor_wallpaper(device_id: str) -> Path | None:
+    """Get the wallpaper currently assigned to a Windows monitor."""
+
+    desktop = CreateObject(
+        "{C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}",
+        interface=IDesktopWallpaper,
+    )
+
+    wallpaper = desktop.GetWallpaper(device_id)
+
+    if not wallpaper:
+        return None
+
+    return Path(wallpaper)
