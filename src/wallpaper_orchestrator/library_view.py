@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from wallpaper_orchestrator.catalog import WallpaperCatalog
-from wallpaper_orchestrator.indexer import scan_all, scan_folder
+from wallpaper_orchestrator.indexer import resolve_folder_link, scan_all, scan_folder
 from wallpaper_orchestrator.watcher import FolderChangeDetector
 
 
@@ -69,7 +69,7 @@ class ScanWorker(QObject):
                         reports = []
                         for folder_id in self.folder_ids:
                             try:
-                                catalog.get_folder_link(folder_id)
+                                resolve_folder_link(catalog, folder_id)
                             except KeyError:
                                 continue  # A link can be removed while queued.
                             reports.append(scan_folder(catalog, folder_id))
@@ -619,7 +619,7 @@ class LibraryPanel(QWidget):
         if not folder_id:
             return None
         with WallpaperCatalog() as catalog:
-            return catalog.get_folder_link(folder_id).path
+            return resolve_folder_link(catalog, folder_id).path
 
     def _open_folder(self) -> None:
         try:

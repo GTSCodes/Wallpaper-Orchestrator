@@ -84,6 +84,23 @@ def _order_candidates(candidates, folder: Path | None, profile: Mapping, device_
     order = profile.get("order", "random")
     if order == "random":
         random.shuffle(candidates)
+        # A shuffle should visibly change the wallpaper whenever it can.
+        # The old random path could immediately reselect the current image.
+        if len(candidates) > 1:
+            try:
+                current = get_monitor_wallpaper(device_id)
+            except Exception:
+                # Query failures should not prevent an otherwise valid random
+                # shuffle. Saved history still gives a useful best effort.
+                current = None
+            current = current or profile.get("last_image", "")
+            if current and _path_key(candidates[0].path) == _path_key(Path(current)):
+                alternative = next((index for index, wallpaper in enumerate(candidates[1:], 1)
+                                    if _path_key(wallpaper.path) != _path_key(Path(current))), None)
+                if alternative is not None:
+                    candidates[0], candidates[alternative] = (
+                        candidates[alternative], candidates[0]
+                    )
         return candidates
     if order not in {"next", "previous"}:
         raise ValueError("Unknown wallpaper order. Choose Random, Next, or Previous.")

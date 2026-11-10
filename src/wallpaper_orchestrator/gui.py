@@ -1,6 +1,9 @@
 """Monitor-first desktop interface for Wallpaper Orchestrator."""
 
 import sys
+import time
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QSettings, QTimer, Qt
@@ -35,8 +38,18 @@ from PySide6.QtWidgets import (
 )
 
 from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
+from wallpaper_orchestrator.automation import (
+    load_automation, matching_rule, remove_interval, save_automation, set_interval,
+)
+from wallpaper_orchestrator.automation_view import AutomateDialog
+from wallpaper_orchestrator.background import (
+    agent_alive, agent_health_text, apply_due_in_foreground_if_agent_missing,
+    install_startup, start_agent, uninstall_startup,
+)
 from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.library_view import LibraryPanel
+from wallpaper_orchestrator.schedule_view import SchedulesPanel
+from wallpaper_orchestrator.scheduler import resolve_targets
 from wallpaper_orchestrator.platforms.windows import (
     discover_monitors,
     get_monitor_wallpaper,
@@ -418,6 +431,7 @@ class WallpaperWindow(QMainWindow):
         self.selected_device_ids = []
         self.monitor_items = {}
         self._restoring = False
+        self._last_agent_launch = 0.0
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
@@ -467,6 +481,14 @@ class WallpaperWindow(QMainWindow):
             self.settings.value("cross_monitor_limits_enabled", False, type=bool)
         )
         display_row.addWidget(self.cross_monitor_limits)
+        self.automate_button = QPushButton("Automate")
+        self.automate_button.setObjectName("quietButton")
+        self.automate_button.setToolTip(
+            "Create a recurring shuffle for the selected monitor(s)."
+        )
+        self.automate_button.clicked.connect(self.automate_selection)
+        self.automate_button.setEnabled(False)
+        display_row.addWidget(self.automate_button)
         self.select_all_button = QPushButton("Select all")
         self.select_all_button.setObjectName("quietButton")
         self.select_all_button.clicked.connect(self.toggle_select_all)
@@ -619,10 +641,12 @@ class WallpaperWindow(QMainWindow):
                                     border-bottom: 2px solid #77a9de; }
         """)
 
-        # Separate catalogue management from monitor wallpaper selection.
-        # Collection subscriptions will be integrated into Displays in C1.
+        # Separate catalogue management and timed updates from monitor settings.
         self.library_panel = LibraryPanel(self)
         self.tabs.addTab(self.library_panel, "Library")
+        self.schedules_panel = SchedulesPanel(self.monitors, self.mapping, self)
+        self.tabs.addTab(self.schedules_panel, "Schedules")
+        self.schedules_panel.run_now_requested.connect(self._run_manual_schedule)
         self.tabs.currentChanged.connect(self._tab_changed)
 
         self.source_mode.currentIndexChanged.connect(self.source_changed)
@@ -650,6 +674,12 @@ class WallpaperWindow(QMainWindow):
         self._preview_timer.setInterval(15000)
         self._preview_timer.timeout.connect(self.refresh_wallpaper_previews)
         self._preview_timer.start()
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.setInterval(20000)
+        self._schedule_timer.timeout.connect(self._schedule_tick)
+        self._schedule_timer.start()
+        QTimer.singleShot(1500, self._schedule_tick)
+        QTimer.singleShot(2500, self._ensure_background_agent)
         if self.monitors:
             self.monitor_items[self.monitors[0].device_id].setSelected(True)
         else:
@@ -723,6 +753,7 @@ class WallpaperWindow(QMainWindow):
 
         self.select_all_button.setEnabled(bool(self.monitors))
         self.monitor_selected()
+        self.schedules_panel.update_monitors(self.monitors, self.mapping)
         self.view.viewport().update()
         self.refresh_button.setToolTip("Refresh displays")
         if self.monitors:
@@ -770,8 +801,226 @@ class WallpaperWindow(QMainWindow):
         if index == 0:
             self.update_collection_summary()
             self.refresh_wallpaper_previews()
-        else:
+        elif index == 1:
             self.library_panel.refresh_collections()
+        elif index == 2:
+            self.schedules_panel.reload_results()
+            self.schedules_panel.update_monitors(self.monitors, self.mapping)
+
+    def _schedule_tick(self):
+        """Check wall-clock time (including missed times after PC sleep)."""
+        try:
+            if load_automation().background_enabled:
+                # C3 silently abandoned the GUI timer as soon as the *setting*
+                # was enabled, even if pythonw.exe failed to launch. Keep
+                # the interface useful while an agent is unavailable. The
+                # agent's named mutex serializes the two execution paths.
+                if not agent_alive():
+                    executed, result = apply_due_in_foreground_if_agent_missing()
+                    if executed and result:
+                        self.refresh_wallpaper_previews(force=True)
+                        self.status.setText(f"Automatic update: {result}")
+                self._ensure_background_agent()
+                if self.tabs.currentIndex() == 2:
+                    self.schedules_panel.reload_results()
+                return
+        except Exception as error:
+            self.schedules_panel.report_result(f"Automation settings error: {error}")
+            self.status.setText(
+                f"Automatic update error: {error}. Use the automation status "
+                "command to investigate."
+            )
+            return
+        now = datetime.now().astimezone()
+        due = self.schedules_panel.get_due(now)
+        if due:
+            self._run_schedule_rules(due)
+
+    def _run_manual_schedule(self, rules):
+        self._run_schedule_rules(rules, manual=True)
+
+    def _run_schedule_rules(self, rules, *, manual=False):
+        """Apply one coordinated plan for all due rules, never twice at once."""
+        now = datetime.now().astimezone()
+        try:
+            active = {m.device_id for m in discover_monitors()}
+            targets = resolve_targets(rules, active, self.profiles)
+        except Exception as error:
+            self.schedules_panel.report_result(
+                f"Cannot check displays for scheduled updates: {error}"
+            )
+            return
+
+        ids = set(targets.attempted_ids)
+        if not ids:
+            self.schedules_panel.report_result(
+                "Schedule is waiting for its disconnected monitor to return."
+            )
+            return
+
+        # Automatic attempts are stamped before applying so restarts and the
+        # repeated DST hour cannot trigger duplicates. "Run now" is just a
+        # test; it must not consume the upcoming timed occurrence.
+        if not manual and not self.schedules_panel.mark_attempts(
+            ids, now, "Starting update..."
+        ):
+            return
+
+        def record(message):
+            if manual:
+                self.schedules_panel.record_manual_result(ids, message)
+            else:
+                self.schedules_panel.mark_attempts(ids, now, message)
+            self.schedules_panel.report_result(message)
+
+        if not targets.device_ids:
+            record(
+                "No eligible shuffling displays; fixed-image monitors stay unchanged."
+            )
+            return
+
+        try:
+            shared = self.library_path.text()
+            assignments, device_ids = create_profile_plan(
+                Path(shared) if shared else None, self.profiles,
+                selected_device_ids=set(targets.device_ids),
+                respect_theme_limits=self.cross_monitor_limits.isChecked(),
+            )
+            apply_plan(assignments, device_ids)
+            for device_id, wallpaper in assignments.items():
+                self.profiles.setdefault(device_id, default_profile())[
+                    "last_image"
+                ] = str(wallpaper.path)
+            history_error = None
+            try:
+                save_profiles(self.profiles)
+            except OSError as error:
+                history_error = str(error)
+            self.refresh_wallpaper_previews(force=True)
+            message = (
+                f"Applied to {display_count_text(len(assignments))} "
+                f"at {now.strftime('%H:%M')}."
+            )
+            if history_error:
+                message += f" Last-image history could not be saved: {history_error}"
+            record(message)
+            self.status.setText(message)
+        except Exception as error:
+            message = f"Scheduled update failed: {error}"
+            record(message)
+
+    def _ensure_background_agent(self):
+        """Start the login agent when enabled, without spawning duplicates."""
+        try:
+            if not load_automation().background_enabled or agent_alive():
+                return
+            if time.monotonic() - self._last_agent_launch < 45:
+                return
+            self._last_agent_launch = time.monotonic()
+            start_agent()
+        except Exception as error:
+            self.schedules_panel.report_result(
+                f"Cannot start background wallpaper automation: {error}"
+            )
+            self.status.setText(f"Background automation could not start: {error}")
+
+    def _report_agent_startup(self):
+        """Report hidden-process health in the existing Displays status line."""
+        try:
+            if not load_automation().background_enabled:
+                return
+            health = agent_health_text()
+            self.status.setText(f"Background automation: {health}")
+        except (OSError, ValueError) as error:
+            self.status.setText(f"Background automation settings error: {error}")
+
+    def automate_selection(self):
+        """Keep the Displays layout concise: configure intervals in a dialog."""
+        ids = self.selected_device_ids[:]
+        if not ids:
+            return
+        fixed = [
+            device_id for device_id in ids
+            if self.profiles.get(device_id, {}).get("mode") == "fixed"
+        ]
+        if fixed:
+            QMessageBox.information(
+                self, "Automate Displays",
+                "Fixed-image displays cannot be shuffled automatically. "
+                "Change their Wallpaper mode to Folder or Collections first."
+            )
+            return
+        try:
+            original = load_automation()
+            existing = matching_rule(original, ids)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Automation Error", str(error))
+            return
+        orders = [
+            self.profiles.get(device_id, {}).get("order", "random").title()
+            for device_id in ids
+        ]
+        order_description = ", ".join(orders)
+        dialog = AutomateDialog(
+            len(ids), order_description, existing,
+            original.background_enabled, agent_health_text(), self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.action == "save" and not dialog.background.isChecked():
+            QMessageBox.information(
+                self, "Enable Background Automation",
+                "Check 'Run even when the application window is closed' "
+                "to activate this interval. You can disable it later using "
+                "the same Automate dialog."
+            )
+            return
+        # The independent agent may have advanced another interval while
+        # this dialog was open. Re-read before applying the user's edit.
+        try:
+            original = load_automation()
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Automation Error", str(error))
+            return
+        try:
+            updated = (
+                remove_interval(original, ids) if dialog.action == "remove"
+                else set_interval(original, ids, dialog.interval_seconds())
+            )
+            updated = replace(
+                updated, background_enabled=dialog.background.isChecked()
+            )
+            if updated.background_enabled:
+                install_startup()  # Explicit user opt-in; only their HKCU key.
+            save_automation(updated)
+            if updated.background_enabled:
+                self._last_agent_launch = time.monotonic()
+                start_agent()
+                # A successful Popen only confirms process creation, not
+                # that imports, COM initialisation or indexing succeeded.
+                QTimer.singleShot(12000, self._report_agent_startup)
+            else:
+                uninstall_startup()
+        except Exception as error:
+            # An unsuccessful enable must not leave the GUI believing a
+            # nonexistent worker owns all daily scheduled updates.
+            try:
+                save_automation(original)
+                if not original.background_enabled:
+                    uninstall_startup()
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Automation Error", str(error))
+            return
+        if dialog.action == "remove":
+            self.status.setText("Removed this interval automation.")
+        else:
+            self.status.setText(
+                f"Automating {display_count_text(len(ids))} every "
+                f"{dialog.number.value()} {dialog.unit.currentText().lower()}."
+            )
+            if dialog.run_now.isChecked():
+                self.change_selection()
 
     def toggle_select_all(self):
         select = len(self.selected_device_ids) != len(self.monitors)
@@ -934,6 +1183,7 @@ class WallpaperWindow(QMainWindow):
 
     def update_action(self):
         ids = self.selected_device_ids
+        self.automate_button.setEnabled(bool(ids))
         if not ids:
             self.action_button.setText("Select a display")
             self.action_button.setEnabled(False)
@@ -1111,6 +1361,7 @@ class WallpaperWindow(QMainWindow):
             )
             event.ignore()
             return
+        self._schedule_timer.stop()
         self.library_panel.stop_watching()
         super().closeEvent(event)
 

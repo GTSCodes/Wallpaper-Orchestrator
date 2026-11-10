@@ -60,6 +60,27 @@ class CollectionSelectionTests(unittest.TestCase):
         profile["mode"] = mode
         return profile
 
+    def test_random_order_does_not_reuse_current_if_alternative_exists(self):
+        current = SimpleNamespace(path=self.root / "current.jpg")
+        other = SimpleNamespace(path=self.root / "other.jpg")
+        options = [current, other]
+        with patch.object(engine, "get_monitor_wallpaper", return_value=str(current.path)), \
+             patch.object(engine.random, "shuffle"):
+            actual = engine._order_candidates(options, None, {"order": "random"}, "p")
+        self.assertEqual(actual[0], other)
+        self.assertEqual(actual[1], current)
+
+    def test_random_order_survives_windows_current_wallpaper_query_failure(self):
+        current = SimpleNamespace(path=self.root / "current.jpg")
+        other = SimpleNamespace(path=self.root / "other.jpg")
+        with patch.object(engine, "get_monitor_wallpaper", side_effect=OSError("COM unavailable")), \
+             patch.object(engine.random, "shuffle"):
+            ordered = engine._order_candidates(
+                [current, other], None,
+                {"order": "random", "last_image": str(current.path)}, "p",
+            )
+        self.assertEqual(ordered[0], other)
+
     def test_one_monitor_selects_its_collection_image(self):
         collection = self.catalog.create_collection("Nature")
         image = self.add_image(collection.id, "nature.png", (900, 1600))

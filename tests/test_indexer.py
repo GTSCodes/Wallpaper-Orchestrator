@@ -12,7 +12,9 @@ from PIL import Image
 
 from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.catalog_models import ImageMetadata
-from wallpaper_orchestrator.indexer import main, scan_all, scan_folder
+from wallpaper_orchestrator.indexer import (
+    main, resolve_folder_link, scan_all, scan_folder,
+)
 
 
 class IndexerTests(unittest.TestCase):
@@ -42,6 +44,25 @@ class IndexerTests(unittest.TestCase):
         records = self.catalog.list_collection_images(self.collection.id)
         self.assertEqual({r.orientation for r in records}, {"portrait", "landscape"})
         self.assertEqual(len(records), 2)
+
+    def test_early_catalog_without_get_folder_link_still_scans(self):
+        """A mixed B1/C3 installation must not disable background indexing."""
+        class LegacyCatalogue:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def __getattr__(self, name):
+                if name == "get_folder_link":
+                    raise AttributeError(name)
+                return getattr(self.wrapped, name)
+
+        legacy = LegacyCatalogue(self.catalog)
+        self.create_image("legacy.png")
+        self.assertEqual(resolve_folder_link(legacy, self.link.id).path, self.folder)
+        result = scan_folder(legacy, self.link.id)
+        self.assertEqual((result.status, result.added), ("ok", 1))
+        with self.assertRaises(KeyError):
+            resolve_folder_link(legacy, "missing-id")
 
     def test_repeat_scan_reuses_cached_dimensions_without_pillow(self):
         self.create_image("same.png")

@@ -1,4 +1,4 @@
-"""SQLite library catalogue for Wallpaper Orchestrator (Milestone B1).
+"""SQLite library catalogue for Wallpaper Orchestrator.
 
 This is deliberately independent from the GUI, Windows COM, and the existing
 JSON monitor profiles. It stores *references* to user files, never file bytes.
@@ -7,14 +7,13 @@ Discovery and filesystem watching will use this API in later milestones.
 
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from pathlib import Path
 from uuid import uuid4
 
 from wallpaper_orchestrator.catalog_models import (
     Collection,
     FolderLink,
-    ImageMetadata,
     ImageRecord,
     Tag,
 )
@@ -247,19 +246,6 @@ class WallpaperCatalog:
             for row in rows
         ]
 
-    def get_folder_link(self, folder_link_id: str) -> FolderLink:
-        row = self._db.execute(
-            """SELECT id, collection_id, path, recursive FROM folder_links
-               WHERE id = ?""",
-            (folder_link_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Unknown folder link: {folder_link_id}")
-        return FolderLink(
-            row["id"], row["collection_id"], Path(row["path"]),
-            bool(row["recursive"]),
-        )
-
     def upsert_image(
         self, path: str | Path, *, width: int, height: int,
         size_bytes: int, modified_ns: int
@@ -297,23 +283,6 @@ class WallpaperCatalog:
             raise KeyError(f"Unknown image: {image_id}")
         return _image_from_row(row)
 
-    def find_image_by_path(self, path: str | Path) -> ImageRecord | None:
-        """Look up cached dimensions by normalised, absolute filesystem path."""
-        _, key = _normalised_path(path)
-        row = self._db.execute(
-            "SELECT * FROM images WHERE path_key = ?", (key,)
-        ).fetchone()
-        return _image_from_row(row) if row is not None else None
-
-    def list_folder_images(self, folder_link_id: str) -> list[ImageRecord]:
-        rows = self._db.execute(
-            """SELECT i.* FROM images AS i
-               JOIN folder_images AS fi ON fi.image_id = i.id
-               WHERE fi.folder_link_id = ? ORDER BY i.path_key""",
-            (folder_link_id,),
-        )
-        return [_image_from_row(row) for row in rows]
-
     def set_image_availability(self, image_id: str, available: bool) -> None:
         """Keep metadata for temporarily disconnected drives/cloud folders."""
         if type(available) is not bool:
@@ -340,95 +309,6 @@ class WallpaperCatalog:
                 "DELETE FROM folder_images WHERE folder_link_id = ? AND image_id = ?",
                 (folder_link_id, image_id),
             )
-
-    def apply_folder_scan(
-        self,
-        folder_link_id: str,
-        inspected: Sequence[ImageMetadata],
-        *,
-        cached_ids: Iterable[str] = (),
-        invalid_ids: Iterable[str] = (),
-        unavailable_ids: Iterable[str] = (),
-        prune_missing: bool = True,
-    ) -> tuple[int, int, int]:
-        """Apply an entire folder scan in one SQLite transaction.
-
-        `inspected` holds newly read or modified image metadata. `cached_ids`
-        were unchanged and did not need Pillow. `invalid_ids` are previously
-        indexed images that are currently unreadable; their memberships remain
-        but they are made ineligible. `unavailable_ids` refer to missing files.
-        If a directory walk was incomplete, pruning must be disabled so an
-        inaccessible subdirectory cannot silently empty a collection.
-
-        Returns (new image records, updated image records, removed folder links).
-        No physical images are changed or deleted.
-        """
-        if type(prune_missing) is not bool:
-            raise TypeError("prune_missing must be a boolean")
-        cached = set(cached_ids)
-        invalid = set(invalid_ids)
-        unavailable = set(unavailable_ids)
-        added = updated = 0
-        with self._db:
-            if not self._db.execute(
-                "SELECT 1 FROM folder_links WHERE id = ?", (folder_link_id,)
-            ).fetchone():
-                raise KeyError(f"Unknown folder link: {folder_link_id}")
-
-            previous = {
-                row["image_id"] for row in self._db.execute(
-                    "SELECT image_id FROM folder_images WHERE folder_link_id = ?",
-                    (folder_link_id,),
-                )
-            }
-            seen = cached | invalid
-            for image in inspected:
-                for field, value, minimum in (
-                    ("width", image.width, 1), ("height", image.height, 1),
-                    ("size_bytes", image.size_bytes, 0),
-                    ("modified_ns", image.modified_ns, 0),
-                ):
-                    if type(value) is not int or value < minimum:
-                        raise ValueError(f"{field} must be an integer >= {minimum}.")
-                display, key = _normalised_path(image.path)
-                row = self._db.execute(
-                    "SELECT id FROM images WHERE path_key = ?", (key,)
-                ).fetchone()
-                image_id = row["id"] if row else uuid4().hex
-                if row:
-                    updated += 1
-                else:
-                    added += 1
-                self._db.execute(
-                    """INSERT INTO images
-                       (id, path, path_key, width, height, size_bytes, modified_ns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(path_key) DO UPDATE SET
-                         path = excluded.path, width = excluded.width,
-                         height = excluded.height,
-                         size_bytes = excluded.size_bytes,
-                         modified_ns = excluded.modified_ns, available = 1""",
-                    (image_id, display, key, image.width, image.height,
-                     image.size_bytes, image.modified_ns),
-                )
-                seen.add(image_id)
-
-            if not prune_missing:
-                seen.update(previous)
-            removed = previous - seen
-            self._db.executemany(
-                "DELETE FROM folder_images WHERE folder_link_id = ? AND image_id = ?",
-                [(folder_link_id, image_id) for image_id in removed],
-            )
-            self._db.executemany(
-                "INSERT OR IGNORE INTO folder_images VALUES (?, ?)",
-                [(folder_link_id, image_id) for image_id in seen],
-            )
-            self._db.executemany(
-                "UPDATE images SET available = 0 WHERE id = ?",
-                [(image_id,) for image_id in invalid | unavailable],
-            )
-        return added, updated, len(removed)
 
     def add_image_to_collection(self, collection_id: str, image_id: str) -> None:
         """Manual membership survives unlinking a folder."""
@@ -488,25 +368,6 @@ class WallpaperCatalog:
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"A tag named '{display}' already exists.") from exc
         return tag
-
-    def rename_tag(self, tag_id: str, name: str) -> None:
-        """Rename a descriptive tag without losing any image associations."""
-        display, key = _normalised_name(name)
-        try:
-            with self._db:
-                cursor = self._db.execute(
-                    "UPDATE tags SET name = ?, name_key = ? WHERE id = ?",
-                    (display, key, tag_id),
-                )
-                if cursor.rowcount != 1:
-                    raise KeyError(f"Unknown tag: {tag_id}")
-        except sqlite3.IntegrityError as exc:
-            raise ValueError(f"A tag named '{display}' already exists.") from exc
-
-    def delete_tag(self, tag_id: str) -> None:
-        """Remove the label and image-tag links, never the image records."""
-        with self._db:
-            self._db.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
 
     def list_tags(self) -> list[Tag]:
         rows = self._db.execute("SELECT id, name FROM tags ORDER BY name_key")

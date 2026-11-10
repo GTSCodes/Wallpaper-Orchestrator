@@ -75,13 +75,30 @@ def _read_metadata(path: Path, before: os.stat_result) -> ImageMetadata:
     )
 
 
+def resolve_folder_link(catalog: WallpaperCatalog, folder_link_id: str) -> FolderLink:
+    """Find a linked folder, including catalogues from early B1 versions.
+
+    Some installations still have a catalog.py without get_folder_link().
+    The listing API predates B2 and is sufficient to resolve the same stable
+    folder ID. This compatibility path never modifies the user's database.
+    """
+    direct = getattr(catalog, "get_folder_link", None)
+    if callable(direct):
+        return direct(folder_link_id)
+    for collection in catalog.list_collections():
+        for link in catalog.list_folder_links(collection.id):
+            if link.id == folder_link_id:
+                return link
+    raise KeyError(f"Unknown folder link: {folder_link_id}")
+
+
 def scan_folder(catalog: WallpaperCatalog, folder_link_id: str) -> IndexReport:
     """Synchronise one linked directory with its cached catalogue records.
 
     An unavailable root is left untouched. If a walk is incomplete, existing
     associations are preserved rather than mistaken for deleted files.
     """
-    link = catalog.get_folder_link(folder_link_id)
+    link = resolve_folder_link(catalog, folder_link_id)
     if not link.path.is_dir():
         previous = catalog.list_folder_images(folder_link_id)
         catalog.apply_folder_scan(
