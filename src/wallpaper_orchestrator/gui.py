@@ -22,12 +22,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStackedWidget,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
+from wallpaper_orchestrator.library_view import LibraryPanel
 from wallpaper_orchestrator.platforms.windows import (
     discover_monitors,
     set_monitor_wallpaper,
@@ -330,8 +332,11 @@ class WallpaperWindow(QMainWindow):
         self.monitor_items = {}
         self._restoring = False
 
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+        self.setCentralWidget(self.tabs)
         root = QWidget()
-        self.setCentralWidget(root)
+        self.tabs.addTab(root, "Displays")
         layout = QVBoxLayout(root)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(9)
@@ -340,13 +345,17 @@ class WallpaperWindow(QMainWindow):
         title.setObjectName("title")
         layout.addWidget(title)
         # Shared library: fallback for any monitor without a custom folder.
-        library_caption = QLabel("LIBRARY")
+        library_caption = QLabel("MAIN WALLPAPER FOLDER")
         library_caption.setObjectName("sectionLabel")
         layout.addWidget(library_caption)
         library_row = QHBoxLayout()
         self.library_path = QLineEdit()
         self.library_path.setReadOnly(True)
         self.library_path.setPlaceholderText("Choose wallpaper folder")
+        self.library_path.setToolTip(
+            "Current folder-based monitor source. Collection subscriptions "
+            "will be connected to Displays in C1."
+        )
         saved = self.settings.value("wallpaper_library", "", type=str)
         if saved and Path(saved).is_dir():
             self.library_path.setText(saved)
@@ -491,7 +500,19 @@ class WallpaperWindow(QMainWindow):
             QToolButton#refreshButton { background: transparent; border: none;
                 color: #8793a2; font-size: 18px; padding: 0; }
             QToolButton#refreshButton:hover { color: #d2dbe5; }
+            QTabWidget#mainTabs::pane { border: 1px solid #343c49;
+                                         border-radius: 5px; }
+            QTabBar::tab { background: #1b2029; color: #aab8ca;
+                           border: 1px solid #343c49; border-bottom: 0;
+                           padding: 8px 20px; margin-right: 3px; }
+            QTabBar::tab:selected { background: #292f3b; color: #f4f6fb;
+                                    border-bottom: 2px solid #77a9de; }
         """)
+
+        # Separate catalogue management from monitor wallpaper selection.
+        # Collection subscriptions will be integrated into Displays in C1.
+        self.library_panel = LibraryPanel(self)
+        self.tabs.addTab(self.library_panel, "Library")
 
         self.source_mode.currentIndexChanged.connect(self.source_changed)
         self.folder_order.currentIndexChanged.connect(self.order_changed)
@@ -866,6 +887,17 @@ class WallpaperWindow(QMainWindow):
             QMessageBox.critical(self, "Wallpaper Error", str(error))
             return
         self.status.setText(result)
+
+    def closeEvent(self, event):
+        """Keep the scan worker alive until its database update completes."""
+        if self.library_panel.scan_running():
+            QMessageBox.information(
+                self, "Library Scan Running",
+                "Please wait for the library scan to finish before closing."
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 def main():
