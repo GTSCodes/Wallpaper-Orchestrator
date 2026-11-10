@@ -1,9 +1,11 @@
 """Wallpaper selection/application shared by the CLI and GUI."""
 
 from collections import Counter
+from collections.abc import Collection
 from pathlib import Path
 from typing import Mapping
 import random
+import re
 
 from wallpaper_orchestrator.config import load_config
 from wallpaper_orchestrator.library import load_wallpapers
@@ -64,11 +66,51 @@ def _path_key(path: Path) -> str:
     return str(path.resolve()).casefold()
 
 
+def _natural_path_key(path: Path, root: Path):
+    """Sort folder entries like File Explorer (image2 before image10)."""
+    relative = path.relative_to(root).as_posix().casefold()
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part)
+        for part in re.split(r"(\d+)", relative)
+    )
+
+
+def _order_candidates(candidates, folder: Path, profile: Mapping, device_id: str):
+    """Prioritize random, next, or previous images without changing rules."""
+    order = profile.get("order", "random")
+    if order == "random":
+        random.shuffle(candidates)
+        return candidates
+    if order not in {"next", "previous"}:
+        raise ValueError("Unknown wallpaper order. Choose Random, Next, or Previous.")
+
+    candidates.sort(key=lambda wallpaper: _natural_path_key(wallpaper.path, folder))
+    position_by_path = {
+        _path_key(wallpaper.path): index
+        for index, wallpaper in enumerate(candidates)
+    }
+    # Follow the actual desktop when possible, falling back to saved history.
+    current = get_monitor_wallpaper(device_id)
+    saved = profile.get("last_image", "")
+    current_key = _path_key(Path(current)) if current else None
+    saved_key = _path_key(Path(saved)) if saved else None
+    last_index = position_by_path.get(current_key)
+    if last_index is None:
+        last_index = position_by_path.get(saved_key)
+    step = 1 if order == "next" else -1
+    start = (last_index + step) % len(candidates) if last_index is not None else (
+        0 if step == 1 else len(candidates) - 1
+    )
+    return [candidates[(start + offset * step) % len(candidates)]
+            for offset in range(len(candidates))]
+
+
 def create_profile_plan(
     library_folder: Path | None,
     profiles: Mapping[str, dict],
     *,
     selected_device_id: str | None = None,
+    selected_device_ids: Collection[str] | None = None,
 ):
     """Plan a shuffle while preserving all monitors that are not targeted.
 
@@ -82,9 +124,17 @@ def create_profile_plan(
     if not detected:
         raise ValueError("No active monitors detected.")
 
+    if selected_device_id is not None and selected_device_ids is not None:
+        raise ValueError("Choose one selection method at a time.")
+
     active = {m.device_id: m for m in detected}
-    if selected_device_id is not None and selected_device_id not in active:
-        raise ValueError("That monitor is no longer active.")
+    explicit_ids = (
+        set(selected_device_ids) if selected_device_ids is not None
+        else {selected_device_id} if selected_device_id is not None
+        else None
+    )
+    if explicit_ids is not None and not explicit_ids.issubset(active):
+        raise ValueError("A selected monitor is no longer active.")
 
     # Only random-folder monitors can be shuffled.
     targets = []
@@ -94,13 +144,18 @@ def create_profile_plan(
         mode = profile.get("mode", "folder")
         if mode not in {"fixed", "folder"}:
             raise ValueError("Unknown wallpaper source mode.")
-        if mode == "fixed":
+        if explicit_ids is not None and m.device_id not in explicit_ids:
             continue
-        if selected_device_id is None:
+        if mode == "fixed":
+            if explicit_ids is not None:
+                raise ValueError(
+                    "A selected monitor uses a fixed image. Select only "
+                    "monitors set to shuffle from a folder."
+                )
+            continue
+        if explicit_ids is None:
             if profile.get("shuffle_all", True) is not True:
                 continue
-        elif m.device_id != selected_device_id:
-            continue
 
         raw_folder = profile.get("folder", "") or (
             str(library_folder) if library_folder is not None else ""
@@ -170,8 +225,10 @@ def create_profile_plan(
             raise ValueError(
                 f"No {m.orientation} wallpapers in {sources[m.device_id]}"
             )
-        random.shuffle(candidates)
-        candidate_sets[m.device_id] = candidates
+        candidate_sets[m.device_id] = _order_candidates(
+            candidates, sources[m.device_id], profiles.get(m.device_id, {}),
+            m.device_id,
+        )
 
     # Check more constrained monitors first, then backtrack if needed.
     targets.sort(key=lambda m: len(candidate_sets[m.device_id]))

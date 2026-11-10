@@ -23,6 +23,8 @@ def default_profile() -> dict:
         "mode": "folder",
         "image": "",
         "folder": "",  # Empty means use the shared wallpaper library.
+        "order": "random",  # random, next, or previous (per monitor).
+        "last_image": "",  # Last successfully applied image for folder navigation.
         "shuffle_all": True,
     }
 
@@ -53,8 +55,13 @@ def load_profiles() -> dict[str, dict]:
         profile.update(settings)
         if profile["mode"] not in {"fixed", "folder"}:
             raise ValueError("Unknown wallpaper source mode in preferences.")
-        if any(not isinstance(profile[k], str) for k in ("image", "folder")):
+        if any(not isinstance(profile[k], str)
+               for k in ("image", "folder", "last_image")):
             raise ValueError("Invalid image or folder path in preferences.")
+        if not isinstance(profile["order"], str) or profile["order"] not in {
+            "random", "next", "previous"
+        }:
+            raise ValueError("Invalid wallpaper order in preferences.")
         if type(profile["shuffle_all"]) is not bool:
             raise ValueError("Invalid Shuffle All preference.")
         result[device_id] = profile
