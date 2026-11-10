@@ -1,42 +1,48 @@
-"""Graphical interface for Wallpaper Orchestrator."""
+"""Monitor-first desktop interface for Wallpaper Orchestrator."""
 
 import sys
-
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRectF, QSettings
-from PySide6.QtGui import QColor, QBrush, QPen, QPainter
+from PySide6.QtCore import QRectF, QSettings, Qt
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
     QGraphicsItem,
     QGraphicsScene,
     QGraphicsView,
-    QLabel,
-    QMainWindow,
-    QVBoxLayout,
-    QWidget,
-    QFileDialog,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
+    QMainWindow,
     QMessageBox,
     QPushButton,
-    QComboBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
-from wallpaper_orchestrator.platforms.windows import discover_monitors, set_monitor_wallpaper
+from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
+from wallpaper_orchestrator.platforms.windows import (
+    discover_monitors,
+    set_monitor_wallpaper,
+)
+from wallpaper_orchestrator.profiles import (
+    default_profile,
+    load_profiles,
+    save_profiles,
+)
 from wallpaper_orchestrator.state import load_monitor_mapping
-from wallpaper_orchestrator.engine import create_plan, apply_plan
-from wallpaper_orchestrator.library import load_wallpapers
-from wallpaper_orchestrator.models import Monitor
-from wallpaper_orchestrator.selector import choose_wallpaper
 
 
 class MonitorView(QGraphicsView):
-    """Display monitors using their actual relative geometry."""
+    """Fit the monitor geometry to the available view space."""
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-
         if self.scene() and not self.scene().sceneRect().isEmpty():
             self.fitInView(
                 self.scene().sceneRect(),
@@ -45,451 +51,349 @@ class MonitorView(QGraphicsView):
 
 
 class WallpaperWindow(QMainWindow):
-    """Main application window."""
+    """One selected monitor, one source, and two explicit actions."""
 
     def __init__(self):
         super().__init__()
-        self.settings = QSettings(
-        "WallpaperOrchestrator",
-        "WallpaperOrchestrator",
-    )
-
         self.setWindowTitle("Wallpaper Orchestrator")
-        self.resize(1000, 650)
+        self.resize(1080, 800)
 
+        # Keep the existing global library preference from older GUI versions.
+        self.settings = QSettings("WallpaperOrchestrator", "WallpaperOrchestrator")
         self.mapping = load_monitor_mapping()
         self.monitors = discover_monitors()
+        self.profiles = load_profiles()
         self.selected_device_id = None
+        self.monitor_items = {}
+        self._restoring = False
 
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("Wallpaper Orchestrator")
+        title.setObjectName("title")
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Choose a display, set its wallpaper source, then change one or all displays."
+        )
+        subtitle.setObjectName("muted")
+        layout.addWidget(subtitle)
+
+        # Shared library: fallback for any monitor without a custom folder.
+        library_caption = QLabel("MAIN WALLPAPER LIBRARY")
+        library_caption.setObjectName("sectionLabel")
+        layout.addWidget(library_caption)
+        library_row = QHBoxLayout()
+        self.library_path = QLineEdit()
+        self.library_path.setReadOnly(True)
+        self.library_path.setPlaceholderText("Choose your main wallpaper library...")
+        saved = self.settings.value("wallpaper_library", "", type=str)
+        if saved and Path(saved).is_dir():
+            self.library_path.setText(saved)
+        choose_library = QPushButton("Choose Library")
+        choose_library.clicked.connect(self.choose_library)
+        library_row.addWidget(self.library_path, 1)
+        library_row.addWidget(choose_library)
+        layout.addLayout(library_row)
+
+        display_caption = QLabel("YOUR DISPLAYS · Click a monitor to configure it")
+        display_caption.setObjectName("sectionLabel")
+        layout.addWidget(display_caption)
         self.scene = QGraphicsScene(self)
         self.view = MonitorView(self.scene)
-        self.view.setBackgroundBrush(QColor("#171b23"))
+        self.view.setMinimumHeight(270)
+        self.view.setBackgroundBrush(QColor("#151b24"))
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        layout.addWidget(self.view, 1)
 
-        self.info = QLabel("Select a monitor to configure it.")
-        self.info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.info.setStyleSheet(
-            "color: white; font-size: 15px; padding: 12px;"
-        )
+        # The controls below all belong to the currently selected monitor.
+        self.panel = QFrame()
+        self.panel.setObjectName("monitorPanel")
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(16, 14, 16, 14)
+        panel_layout.setSpacing(10)
+        self.selected_heading = QLabel("Select a monitor above")
+        self.selected_heading.setObjectName("panelTitle")
+        panel_layout.addWidget(self.selected_heading)
 
-        self.mode_label = QLabel("Wallpaper behaviour:")
-        self.mode_label.setStyleSheet("color: white;")
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Wallpaper source"))
+        self.source_mode = QComboBox()
+        self.source_mode.addItem("One specific wallpaper", "fixed")
+        self.source_mode.addItem("Random images from a folder", "folder")
+        source_row.addWidget(self.source_mode, 1)
+        panel_layout.addLayout(source_row)
 
-        self.mode_selector = QComboBox()
-
-        self.mode_selector.addItems([
-            "Fixed Image",
-            "Random Folder",
-            "Coordinated",
-        ])
-
-        self.mode_selector.setEnabled(False)
-
-        container = QWidget()
-        layout = QVBoxLayout(container)
-
-        layout.addWidget(self.view, stretch=1)
-        layout.addWidget(self.info)
-        layout.addWidget(self.mode_label)
-        layout.addWidget(self.mode_selector)
-        # Wallpaper selection controls
+        # Source-specific controls: only the relevant picker is displayed.
+        self.source_pages = QStackedWidget()
+        fixed_page = QWidget()
+        fixed_row = QHBoxLayout(fixed_page)
+        fixed_row.setContentsMargins(0, 0, 0, 0)
         self.image_path = QLineEdit()
-        self.image_path.setPlaceholderText("Select a wallpaper image...")
+        self.image_path.setPlaceholderText("Choose the image to keep on this monitor")
         self.image_path.setReadOnly(True)
+        pick_image = QPushButton("Browse Image")
+        pick_image.clicked.connect(self.choose_image)
+        fixed_row.addWidget(self.image_path, 1)
+        fixed_row.addWidget(pick_image)
+        self.source_pages.addWidget(fixed_page)
 
-        self.browse_button = QPushButton("Browse...")
-        self.browse_button.clicked.connect(self.browse_wallpaper)
+        folder_page = QWidget()
+        folder_row = QHBoxLayout(folder_page)
+        folder_row.setContentsMargins(0, 0, 0, 0)
+        self.source_folder = QLineEdit()
+        self.source_folder.setReadOnly(True)
+        self.source_folder.setPlaceholderText("Uses the main wallpaper library")
+        pick_folder = QPushButton("Choose Folder")
+        pick_folder.clicked.connect(self.choose_monitor_folder)
+        use_main = QPushButton("Use Main Library")
+        use_main.clicked.connect(self.use_main_library)
+        folder_row.addWidget(self.source_folder, 1)
+        folder_row.addWidget(pick_folder)
+        folder_row.addWidget(use_main)
+        self.source_pages.addWidget(folder_page)
+        panel_layout.addWidget(self.source_pages)
 
-        self.apply_button = QPushButton("Apply Wallpaper")
-        self.apply_button.clicked.connect(self.apply_wallpaper)
+        self.include_all = QCheckBox("Include this monitor when I click Shuffle All")
+        panel_layout.addWidget(self.include_all)
+        self.source_hint = QLabel("")
+        self.source_hint.setWordWrap(True)
+        self.source_hint.setObjectName("muted")
+        panel_layout.addWidget(self.source_hint)
+        layout.addWidget(self.panel)
 
-        self.shuffle_selected_button = QPushButton("Shuffle Selected Monitor")
-
-        self.shuffle_selected_button.clicked.connect(
-            self.shuffle_selected
-        )
-
-        self.shuffle_selected_button.setEnabled(False)
-
-        layout.addWidget(self.shuffle_selected_button)
-
-        # A monitor must be selected before applying.
-        self.apply_button.setEnabled(False)
-
-        image_row = QHBoxLayout()
-        image_row.addWidget(self.image_path)
-        image_row.addWidget(self.browse_button)
-
-        layout.addLayout(image_row)
-        layout.addWidget(self.apply_button)
-
-        # Coordinated wallpaper controls
-        self.folder_path = QLineEdit()
-        self.folder_path.setPlaceholderText(
-            "Choose your wallpaper library folder..."
-        )
-        self.folder_path.setReadOnly(True)
-        # Restore the previously selected wallpaper folder.
-        saved_folder = self.settings.value(
-            "wallpaper_library",
-            "",
-            type=str,
-        )
-
-        if saved_folder and Path(saved_folder).is_dir():
-            self.folder_path.setText(saved_folder)
-
-        self.folder_button = QPushButton("Choose Folder")
-        self.folder_button.clicked.connect(self.browse_folder)
-
-        folder_row = QHBoxLayout()
-        folder_row.addWidget(self.folder_path)
-        folder_row.addWidget(self.folder_button)
-
-        self.shuffle_all_button = QPushButton("Shuffle All")
+        # Actions have a single, consistent scope.
+        action_row = QHBoxLayout()
+        self.single_action = QPushButton("Shuffle This Monitor")
+        self.single_action.clicked.connect(self.change_selected)
+        self.shuffle_all_button = QPushButton("Shuffle All Participating Monitors")
+        self.shuffle_all_button.setObjectName("primaryButton")
         self.shuffle_all_button.clicked.connect(self.shuffle_all)
+        action_row.addWidget(self.single_action, 1)
+        action_row.addWidget(self.shuffle_all_button, 1)
+        layout.addLayout(action_row)
+        self.status = QLabel("Ready. Wallpaper preferences save automatically.")
+        self.status.setObjectName("muted")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
 
-        layout.addLayout(folder_row)
-        layout.addWidget(self.shuffle_all_button)
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background: #10151c; color: #e7edf5; }
+            QLabel#title { font-size: 22px; font-weight: 650; }
+            QLabel#panelTitle { font-size: 16px; font-weight: 600; }
+            QLabel#muted { color: #9aaabd; }
+            QLabel#sectionLabel { color: #94a9c4; font-size: 11px; font-weight: bold; }
+            QFrame#monitorPanel { border: 1px solid #354257; border-radius: 9px;
+                                  background: #1b2532; }
+            QFrame#monitorPanel QLabel { background: transparent; }
+            QLineEdit, QComboBox { background: #222e3d; border: 1px solid #45556a;
+                                   border-radius: 6px; padding: 8px; }
+            QPushButton { background: #2b394b; border: 1px solid #465771;
+                          border-radius: 7px; padding: 9px 12px; }
+            QPushButton:hover { background: #384a60; }
+            QPushButton:disabled { color: #708093; background: #1b2532; }
+            QPushButton#primaryButton { background: #2360aa; border-color: #357bc9;
+                                        font-weight: bold; }
+            QPushButton#primaryButton:hover { background: #3476c3; }
+        """)
 
-        self.setCentralWidget(container)
-
-        self.setStyleSheet(
-            "QMainWindow { background-color: #101319; }"
-        )
-
+        self.source_mode.currentIndexChanged.connect(self.source_changed)
+        self.include_all.toggled.connect(self.save_current_profile)
+        self.scene.selectionChanged.connect(self.monitor_selected)
         self.draw_monitors()
-
-        self.scene.selectionChanged.connect(
-            self.monitor_selected
-        )
+        self.panel.setEnabled(False)
+        self.single_action.setEnabled(False)
 
     def draw_monitors(self):
-        """Draw every active monitor at its actual relative position."""
-
-        if not self.monitors:
-            self.info.setText("No active monitors detected.")
-            return
-
-        names_by_id = {
-            device_id: name
-            for name, device_id in self.mapping.items()
-        }
-
-        for index, monitor in enumerate(self.monitors, start=1):
-
-            role = names_by_id.get(
-                monitor.device_id,
-                f"Monitor {index}",
-            )
-
-            rectangle = QRectF(
-                monitor.x,
-                monitor.y,
-                monitor.width,
-                monitor.height,
-            )
-
+        """Use Windows coordinates so orientation/placement are not hardcoded."""
+        names = {device_id: role for role, device_id in self.mapping.items()}
+        for index, monitor in enumerate(self.monitors, 1):
+            role = names.get(monitor.device_id, f"Monitor {index}")
+            rect = QRectF(monitor.x, monitor.y, monitor.width, monitor.height)
             item = self.scene.addRect(
-                rectangle,
-                QPen(QColor("#718096"), 12),
-                QBrush(QColor("#263447")),
+                rect, QPen(QColor("#778aa3"), 12), QBrush(QColor("#29394d"))
             )
-
-            item.setFlag(
-                QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
-            )
-
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
             item.setData(0, role)
             item.setData(1, monitor.device_id)
+            self.monitor_items[monitor.device_id] = item
 
-            # Create a label inside the monitor rectangle.
             label = self.scene.addText(
-                f"{role}\n"
-                f"{monitor.width} × {monitor.height}\n"
-                f"{monitor.orientation.title()}"
+                f"{role}\n{monitor.width} × {monitor.height}\n{monitor.orientation.title()}"
             )
-
             label.setDefaultTextColor(QColor("white"))
-
             font = label.font()
             font.setPixelSize(90)
             label.setFont(font)
-
             bounds = label.boundingRect()
-
             label.setPos(
                 monitor.x + (monitor.width - bounds.width()) / 2,
                 monitor.y + (monitor.height - bounds.height()) / 2,
             )
+            label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
-            # Clicking the label should select the rectangle beneath.
-            label.setAcceptedMouseButtons(
-                Qt.MouseButton.NoButton
+        if self.monitors:
+            bounds = self.scene.itemsBoundingRect()
+            self.scene.setSceneRect(bounds.adjusted(-200, -200, 200, 200))
+            self.view.fitInView(
+                self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
             )
-
-        bounds = self.scene.itemsBoundingRect()
-
-        self.scene.setSceneRect(
-            bounds.adjusted(-200, -200, 200, 200)
-        )
-
-        self.view.fitInView(
-            self.scene.sceneRect(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-        )
+        else:
+            self.status.setText("No active monitors found. Check Windows Display Settings.")
 
     def monitor_selected(self):
-        """Update controls when a monitor is selected."""
+        selected = self.scene.selectedItems()
+        active_item = next((i for i in selected if i.data(1)), None)
+        self.selected_device_id = active_item.data(1) if active_item else None
+        for item in self.monitor_items.values():
+            color = "#5aaffe" if item.isSelected() else "#778aa3"
+            item.setPen(QPen(QColor(color), 16 if item.isSelected() else 12))
 
-        self.selected_device_id = None
+        has_selection = self.selected_device_id is not None
+        self.panel.setEnabled(has_selection)
+        self.single_action.setEnabled(has_selection)
+        if not has_selection:
+            self.selected_heading.setText("Select a monitor above")
+            return
 
-        # Reset controls.
-        self.apply_button.setEnabled(False)
-        self.mode_selector.setEnabled(False)
-        self.shuffle_selected_button.setEnabled(False)
+        monitor = next(m for m in self.monitors if m.device_id == self.selected_device_id)
+        self.selected_heading.setText(
+            f"{active_item.data(0)} · {monitor.width} × {monitor.height} "
+            f"({monitor.orientation})"
+        )
+        profile = self.profiles.get(self.selected_device_id, default_profile())
 
-        for item in self.scene.items():
+        self._restoring = True
+        index = self.source_mode.findData(profile["mode"])
+        self.source_mode.setCurrentIndex(max(0, index))
+        self.image_path.setText(profile["image"])
+        self.source_folder.setText(profile["folder"])
+        self.include_all.setChecked(profile["shuffle_all"])
+        self._restoring = False
+        self.refresh_source_controls()
 
-            if not item.data(1):
-                continue
-
-            if item.isSelected():
-                item.setPen(QPen(QColor("#45a3ff"), 16))
-
-                role = item.data(0)
-
-                self.selected_device_id = item.data(1)
-
-                self.apply_button.setEnabled(True)
-                self.mode_selector.setEnabled(True)
-                self.shuffle_selected_button.setEnabled(True)
-
-                self.info.setText(
-                    f"Selected monitor: {role}"
-                )
-
-            else:
-                item.setPen(QPen(QColor("#718096"), 12))
-
-        if self.selected_device_id is None:
-            self.info.setText(
-                "Select a monitor to configure it."
-            )
-    def browse_wallpaper(self):
-        """Let the user select a wallpaper image."""
-
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Choose Wallpaper",
-            "",
-            "Images (*.jpg *.jpeg *.png *.bmp)",
+    def refresh_source_controls(self):
+        fixed = self.source_mode.currentData() == "fixed"
+        self.source_pages.setCurrentIndex(0 if fixed else 1)
+        self.include_all.setEnabled(not fixed)
+        self.single_action.setText(
+            "Apply This Wallpaper" if fixed else "Shuffle This Monitor"
+        )
+        self.source_hint.setText(
+            "This specific image stays unchanged during Shuffle All."
+            if fixed else
+            "Only this display changes with Shuffle This Monitor. Shuffle All "
+            "changes every participating random-folder monitor and respects "
+            "the global theme limits in config.json."
         )
 
+    def source_changed(self):
+        self.refresh_source_controls()
+        self.save_current_profile()
+
+    def save_current_profile(self):
+        if self._restoring or not self.selected_device_id:
+            return
+        profile = self.profiles.setdefault(
+            self.selected_device_id, default_profile()
+        )
+        profile.update({
+            "mode": self.source_mode.currentData(),
+            "image": self.image_path.text(),
+            "folder": self.source_folder.text(),
+            "shuffle_all": self.include_all.isChecked(),
+        })
+        try:
+            save_profiles(self.profiles)
+        except OSError as error:
+            QMessageBox.critical(self, "Preferences Error", str(error))
+        else:
+            self.status.setText("Monitor preferences saved automatically.")
+
+    def choose_library(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose Main Wallpaper Library", self.library_path.text()
+        )
+        if folder:
+            self.library_path.setText(folder)
+            self.settings.setValue("wallpaper_library", folder)
+            self.settings.sync()
+            self.status.setText("Main wallpaper library saved.")
+
+    def choose_image(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Choose Specific Wallpaper", self.image_path.text(),
+            "Images (*.jpg *.jpeg *.png *.bmp)"
+        )
         if filename:
             self.image_path.setText(filename)
+            self.save_current_profile()
 
-    def browse_folder(self):
-        """Select and remember the wallpaper library."""
-
+    def choose_monitor_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self,
-            "Choose Wallpaper Library",
-            self.folder_path.text(),
+            self, "Choose Folder for This Monitor",
+            self.source_folder.text() or self.library_path.text(),
         )
-
         if folder:
-            self.folder_path.setText(folder)
+            self.source_folder.setText(folder)
+            self.save_current_profile()
 
-            # Remember this folder across application launches.
-            self.settings.setValue(
-                "wallpaper_library",
-                folder,
-            )
+    def use_main_library(self):
+        """Clear this monitor's folder override."""
+        self.source_folder.clear()
+        self.save_current_profile()
 
-            self.settings.sync()
+    def change_selected(self):
+        if not self.selected_device_id:
+            return
+        try:
+            if self.source_mode.currentData() == "fixed":
+                image = Path(self.image_path.text())
+                if not self.image_path.text() or not image.is_file():
+                    raise ValueError("Choose an existing image for this monitor first.")
+                set_monitor_wallpaper(self.selected_device_id, image)
+                result = f"Applied {image.name} to the selected monitor."
+            else:
+                shared = self.library_path.text()
+                assignments, device_ids = create_profile_plan(
+                    Path(shared) if shared else None, self.profiles,
+                    selected_device_id=self.selected_device_id,
+                )
+                apply_plan(assignments, device_ids)
+                result = "Changed only the selected monitor."
+        except Exception as error:
+            QMessageBox.critical(self, "Wallpaper Error", str(error))
+            return
+        self.status.setText(result)
 
     def shuffle_all(self):
-        """Preview and optionally apply coordinated wallpapers."""
-
-        folder = Path(self.folder_path.text())
-
-        if not folder.is_dir():
-            QMessageBox.warning(
-                self,
-                "Invalid Folder",
-                "Please choose an existing wallpaper folder.",
-            )
-            return
-
         try:
-            assignments, device_ids = create_plan(folder)
-
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Planning Error",
-                str(error),
+            shared = self.library_path.text()
+            assignments, device_ids = create_profile_plan(
+                Path(shared) if shared else None, self.profiles
             )
-            return
-
-        # Show the complete plan before applying anything.
-        lines = []
-
-        for role, wallpaper in assignments.items():
-            themes = ", ".join(sorted(wallpaper.themes))
-
-            lines.append(
-                f"{role}\n"
-                f"  Image: {wallpaper.path.name}\n"
-                f"  Themes: {themes}"
-            )
-
-        preview = "\n\n".join(lines)
-
-        try:
+            if not assignments:
+                self.status.setText(
+                    "Nothing to shuffle. Every monitor is fixed or excluded."
+                )
+                return
             apply_plan(assignments, device_ids)
-
         except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Wallpaper Error",
-                str(error),
-            )
+            QMessageBox.critical(self, "Shuffle Error", str(error))
             return
-
-        self.info.setText(
-            "All wallpapers shuffled successfully."
-        )
-
-
-    def apply_wallpaper(self):
-        """Apply the chosen image to the selected monitor."""
-
-        if not self.selected_device_id:
-            QMessageBox.warning(
-                self,
-                "No Monitor Selected",
-                "Please select a monitor first.",
-            )
-            return
-
-        image = Path(self.image_path.text())
-
-        if not image.is_file():
-            QMessageBox.warning(
-                self,
-                "Invalid Wallpaper",
-                "Please select an existing image.",
-            )
-            return
-
-        try:
-            set_monitor_wallpaper(
-                self.selected_device_id,
-                image,
-            )
-
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Wallpaper Error",
-                f"Could not apply wallpaper:\n{error}",
-            )
-            return
-
-        self.info.setText(
-            f"Wallpaper applied successfully: {image.name}"
-        )
-
-    def shuffle_selected(self):
-        """Shuffle the selected monitor using its chosen mode."""
-
-        if not self.selected_device_id:
-            return
-
-        mode = self.mode_selector.currentText()
-
-        if mode == "Fixed Image":
-            self.apply_wallpaper()
-            return
-
-        if mode == "Coordinated":
-            self.shuffle_all()
-            return
-
-        folder = Path(self.folder_path.text())
-
-        if not folder.is_dir():
-            QMessageBox.warning(
-                self,
-                "Folder Required",
-                "Please choose a wallpaper library folder.",
-            )
-            return
-
-        detected = next(
-            (
-                monitor
-                for monitor in self.monitors
-                if monitor.device_id == self.selected_device_id
-            ),
-            None,
-        )
-
-        if detected is None:
-            QMessageBox.critical(
-                self,
-                "Monitor Unavailable",
-                "The selected monitor is no longer active.",
-            )
-            return
-
-        try:
-            wallpapers = load_wallpapers(folder)
-
-            compatible = [
-                wallpaper
-                for wallpaper in wallpapers
-                if wallpaper.path.suffix.lower()
-                in {".jpg", ".jpeg", ".png", ".bmp"}
-                and wallpaper.path.is_file()
-            ]
-
-            monitor = Monitor(
-                role="selected",
-                orientation=detected.orientation,
-            )
-
-            chosen = choose_wallpaper(
-                monitor,
-                compatible,
-            )
-
-            set_monitor_wallpaper(
-                self.selected_device_id,
-                chosen.path,
-            )
-
-        except Exception as error:
-            QMessageBox.critical(
-                self,
-                "Shuffle Error",
-                str(error),
-            )
-            return
-
-        self.info.setText(
-            f"Wallpaper shuffled: {chosen.path.name}"
+        self.status.setText(
+            f"Updated {len(assignments)} participating monitor(s); "
+            "fixed and excluded monitors were left unchanged."
         )
 
 
 def main():
     app = QApplication(sys.argv)
-
     window = WallpaperWindow()
     window.show()
-
     return app.exec()
 
 
