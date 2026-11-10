@@ -1,18 +1,24 @@
-"""Library management UI for Wallpaper Orchestrator (Milestone B3).
+"""Library management UI for Wallpaper Orchestrator (Milestones B3/B4).
 
 This widget does not detect monitors or change wallpapers. Every operation
 uses the B1/B2 catalogue API, so the original image files remain untouched.
+B4 watches linked folders for automatic background indexing.
 """
 
+import threading
+import time
 import warnings
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QObject, QSize, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QObject, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot,
+)
 from PySide6.QtGui import QDesktopServices, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -32,7 +38,8 @@ from PySide6.QtWidgets import (
 )
 
 from wallpaper_orchestrator.catalog import WallpaperCatalog
-from wallpaper_orchestrator.indexer import scan_all
+from wallpaper_orchestrator.indexer import scan_all, scan_folder
+from wallpaper_orchestrator.watcher import FolderChangeDetector
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -45,9 +52,10 @@ class ScanWorker(QObject):
     completed = Signal(object, object)
     failed = Signal(str)
 
-    def __init__(self, collection_id: str | None):
+    def __init__(self, collection_id: str | None, folder_ids: tuple[str, ...] | None = None):
         super().__init__()
         self.collection_id = collection_id
+        self.folder_ids = folder_ids
 
     @Slot()
     def run(self) -> None:
@@ -55,11 +63,27 @@ class ScanWorker(QObject):
             with warnings.catch_warnings(record=True) as captured:
                 warnings.simplefilter("always", Image.DecompressionBombWarning)
                 with WallpaperCatalog() as catalog:
-                    reports = scan_all(catalog, collection_id=self.collection_id)
+                    if self.folder_ids is None:
+                        reports = scan_all(catalog, collection_id=self.collection_id)
+                    else:
+                        reports = []
+                        for folder_id in self.folder_ids:
+                            try:
+                                catalog.get_folder_link(folder_id)
+                            except KeyError:
+                                continue  # A link can be removed while queued.
+                            reports.append(scan_folder(catalog, folder_id))
             warning_text = [str(warning.message) for warning in captured]
             self.completed.emit(reports, warning_text)
         except Exception as error:
             self.failed.emit(str(error))
+
+
+class AutoScanSignals(QObject):
+    """Transport filesystem notifications to Qt's UI thread safely."""
+
+    changed = Signal(object)
+    failed = Signal(str)
 
 
 class LibraryPanel(QWidget):
@@ -70,6 +94,21 @@ class LibraryPanel(QWidget):
         self._image_records = []
         self._scan_thread: QThread | None = None
         self._scan_worker: ScanWorker | None = None
+        self._scan_automatic = False
+        self._scan_auto_ids: tuple[str, ...] = ()
+        self._pending_auto_ids: set[str] = set()
+        self._auto_retry_after = 0.0
+        self._auto_failures = 0
+        self._settings = QSettings("WallpaperOrchestrator", "WallpaperOrchestrator")
+        self._watch_stop = threading.Event()
+        self._watch_wakeup = threading.Event()
+        self._watch_active = threading.Event()
+        self._watch_signals = AutoScanSignals(self)
+        self._watch_signals.changed.connect(self._watch_changed)
+        self._watch_signals.failed.connect(self._watch_failed)
+        self._auto_scan_timer = QTimer(self)
+        self._auto_scan_timer.setSingleShot(True)
+        self._auto_scan_timer.timeout.connect(self._perform_automatic_scan)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 12, 14, 12)
@@ -139,6 +178,15 @@ class LibraryPanel(QWidget):
         self.scan_all_button = QPushButton("Scan all")
         top_row.addWidget(self.scan_collection_button)
         top_row.addWidget(self.scan_all_button)
+        self.auto_scan_checkbox = QCheckBox("Auto-scan")
+        self.auto_scan_checkbox.setToolTip(
+            "Watch linked folders for new, moved, edited or removed images. "
+            "Index them in the background without applying a wallpaper."
+        )
+        self.auto_scan_checkbox.setChecked(
+            self._settings.value("library_auto_scan_enabled", True, type=bool)
+        )
+        top_row.addWidget(self.auto_scan_checkbox)
         right_layout.addLayout(top_row)
 
         search_row = QHBoxLayout()
@@ -225,7 +273,7 @@ class LibraryPanel(QWidget):
         splitter.addWidget(right)
         splitter.setSizes([300, 740])
 
-        self.status = QLabel("Library ready. Images are indexed only when you scan.")
+        self.status = QLabel("Library ready. Linked-folder monitoring is available.")
         self.status.setObjectName("libraryMuted")
         self.status.setWordWrap(True)
         outer.addWidget(self.status)
@@ -261,6 +309,7 @@ class LibraryPanel(QWidget):
             lambda: self._start_scan(self.selected_collection_id())
         )
         self.scan_all_button.clicked.connect(lambda: self._start_scan(None))
+        self.auto_scan_checkbox.toggled.connect(self._auto_scan_toggled)
         self.add_tag_button.clicked.connect(self._assign_tag)
         self.remove_tag_button.clicked.connect(self._remove_image_tag)
         self.new_tag_button.clicked.connect(self._new_tag)
@@ -270,6 +319,12 @@ class LibraryPanel(QWidget):
         self.tag_choice.currentIndexChanged.connect(self._sync_buttons)
 
         self.refresh_collections()
+        if self.auto_scan_checkbox.isChecked():
+            self._watch_active.set()
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop, name="WallpaperAutoIndex", daemon=True
+        )
+        self._watch_thread.start()
 
     @staticmethod
     def _caption(text: str) -> QLabel:
@@ -528,7 +583,13 @@ class LibraryPanel(QWidget):
             with WallpaperCatalog() as catalog:
                 catalog.link_folder(collection_id, folder)
             self._collection_changed()
-            self.status.setText(f"Linked {folder}. Scan to discover its images.")
+            self._watch_wakeup.set()
+            self.status.setText(
+                f"Linked {folder}. "
+                + ("Auto-scan will index its images shortly."
+                   if self.auto_scan_checkbox.isChecked()
+                   else "Use Scan collection to index its images.")
+            )
         except (ValueError, OSError) as error:
             self._error(str(error))
 
@@ -548,6 +609,7 @@ class LibraryPanel(QWidget):
             with WallpaperCatalog() as catalog:
                 catalog.unlink_folder(folder_id)
             self._collection_changed()
+            self._watch_wakeup.set()
             self.status.setText("Folder unlinked. Original files untouched.")
         except Exception as error:
             self._error(str(error))
@@ -658,11 +720,96 @@ class LibraryPanel(QWidget):
     def scan_running(self) -> bool:
         return self._scan_thread is not None
 
-    def _start_scan(self, collection_id: str | None) -> None:
+    def _watch_loop(self) -> None:
+        """Poll only file sizes/timestamps away from Qt's GUI thread."""
+        detector = FolderChangeDetector()
+        last_error = None
+        while not self._watch_stop.is_set():
+            if self._watch_active.is_set():
+                try:
+                    with WallpaperCatalog() as catalog:
+                        links = [
+                            link for collection in catalog.list_collections()
+                            for link in catalog.list_folder_links(collection.id)
+                        ]
+                    changed = detector.poll(links)
+                    last_error = None
+                    if changed and not self._watch_stop.is_set():
+                        self._watch_signals.changed.emit(tuple(sorted(changed)))
+                except Exception as error:
+                    # A busy SQLite file or temporarily unavailable drive
+                    # must never terminate monitoring permanently.
+                    message = str(error)
+                    if message != last_error and not self._watch_stop.is_set():
+                        self._watch_signals.failed.emit(message)
+                    last_error = message
+            self._watch_wakeup.wait(8.0)
+            self._watch_wakeup.clear()
+
+    def _watch_changed(self, folder_ids: tuple[str, ...]) -> None:
+        if self.auto_scan_checkbox.isChecked():
+            self._pending_auto_ids.update(folder_ids)
+            self._auto_scan_timer.start(1500)  # Debounce clustered changes.
+
+    def _watch_failed(self, message: str) -> None:
+        if self.auto_scan_checkbox.isChecked():
+            self.status.setText(
+                "Automatic folder check will retry: " + message
+            )
+
+    def _auto_scan_toggled(self, enabled: bool) -> None:
+        self._settings.setValue("library_auto_scan_enabled", enabled)
+        self._settings.sync()
+        if enabled:
+            self._watch_active.set()
+            self._watch_wakeup.set()
+            # Always reconcile when re-enabling, even if files changed while
+            # the watcher was deliberately turned off.
+            try:
+                with WallpaperCatalog() as catalog:
+                    ids = tuple(
+                        link.id for collection in catalog.list_collections()
+                        for link in catalog.list_folder_links(collection.id)
+                    )
+                self._watch_changed(ids)
+            except Exception as error:
+                self.status.setText(f"Automatic scan will retry: {error}")
+        else:
+            self._watch_active.clear()
+            self._auto_scan_timer.stop()
+            self._pending_auto_ids.clear()
+            self.status.setText("Auto-scan paused. Manual Scan buttons still work.")
+
+    def _perform_automatic_scan(self) -> None:
+        if not self.auto_scan_checkbox.isChecked() or self.scan_running():
+            return
+        if not self._pending_auto_ids:
+            return
+        delay = self._auto_retry_after - time.monotonic()
+        if delay > 0:
+            self._auto_scan_timer.start(max(1000, int(delay * 1000)))
+            return
+        ids = tuple(sorted(self._pending_auto_ids))
+        self._pending_auto_ids.clear()
+        self._start_scan(None, folder_ids=ids, automatic=True)
+
+    def stop_watching(self) -> None:
+        """Release the background poller before the Library UI is destroyed."""
+        self._watch_stop.set()
+        self._watch_wakeup.set()
+        self._auto_scan_timer.stop()
+        self._watch_thread.join(timeout=3.0)
+
+    def _start_scan(
+        self, collection_id: str | None, *,
+        folder_ids: tuple[str, ...] | None = None, automatic: bool = False
+    ) -> None:
         if self.scan_running():
             return
+        self._scan_automatic = automatic
+        self._scan_auto_ids = folder_ids or ()
         self._scan_thread = QThread(self)
-        self._scan_worker = ScanWorker(collection_id)
+        self._scan_worker = ScanWorker(collection_id, folder_ids)
         self._scan_worker.moveToThread(self._scan_thread)
         self._scan_thread.started.connect(self._scan_worker.run)
         self._scan_worker.completed.connect(self._scan_completed)
@@ -672,7 +819,10 @@ class LibraryPanel(QWidget):
         self._scan_thread.finished.connect(self._scan_worker.deleteLater)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
         self._scan_thread.finished.connect(self._scan_finished)
-        self.status.setText("Scanning linked folders in the background...")
+        self.status.setText(
+            "Auto-indexing changed folders in the background..."
+            if automatic else "Scanning linked folders in the background..."
+        )
         self._sync_buttons()
         self._scan_thread.start()
 
@@ -684,11 +834,15 @@ class LibraryPanel(QWidget):
         skipped = sum(report.skipped for report in reports)
         problem_folders = [r for r in reports if r.status != "ok"]
         self.status.setText(
-            f"Scan finished: {added} new, {updated} updated, {cached} cached, "
+            f"{'Auto-scan' if self._scan_automatic else 'Scan'} finished: "
+            f"{added} new, {updated} updated, {cached} cached, "
             f"{skipped} skipped. {len(problem_folders)} unavailable/partial "
             f"folder(s), {len(warning_text)} image warning(s)."
         )
-        if problem_folders or warning_text:
+        if self._scan_automatic:
+            self._auto_failures = 0
+            self._auto_retry_after = 0.0
+        if (problem_folders or warning_text) and not self._scan_automatic:
             details = [f"{r.folder}: {r.status}" for r in problem_folders]
             details += warning_text[:5]
             QMessageBox.warning(
@@ -697,9 +851,21 @@ class LibraryPanel(QWidget):
 
     def _scan_failed(self, message: str) -> None:
         self.status.setText("Scan failed: " + message)
-        self._error(message)
+        if self._scan_automatic:
+            self._pending_auto_ids.update(self._scan_auto_ids)
+            self._auto_failures += 1
+            self._auto_retry_after = time.monotonic() + min(
+                120, 5 * 2 ** min(self._auto_failures - 1, 5)
+            )
+            self.status.setText("Auto-scan will retry: " + message)
+        else:
+            self._error(message)
 
     def _scan_finished(self) -> None:
         self._scan_thread = None
         self._scan_worker = None
+        self._scan_automatic = False
+        self._scan_auto_ids = ()
         self._sync_buttons()
+        if self._pending_auto_ids and self.auto_scan_checkbox.isChecked():
+            self._auto_scan_timer.start(700)

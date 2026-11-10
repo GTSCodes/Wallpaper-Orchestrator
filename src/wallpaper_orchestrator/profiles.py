@@ -20,7 +20,7 @@ def profiles_path() -> Path:
 def default_profile() -> dict:
     """Defaults for a newly detected monitor."""
     return {
-        "mode": "folder",
+        "mode": "folder",  # fixed, folder, or collections
         "image": "",
         "folder": "",  # Empty means use the shared wallpaper library.
         "order": "random",  # random, next, or previous (per monitor).
@@ -53,7 +53,7 @@ def load_profiles() -> dict[str, dict]:
             raise ValueError("Invalid monitor preferences entry.")
         profile = default_profile()
         profile.update(settings)
-        if profile["mode"] not in {"fixed", "folder"}:
+        if profile["mode"] not in {"fixed", "folder", "collections"}:
             raise ValueError("Unknown wallpaper source mode in preferences.")
         if any(not isinstance(profile[k], str)
                for k in ("image", "folder", "last_image")):

@@ -3,11 +3,15 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSettings, QTimer, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QSettings, QTimer, Qt
+from PySide6.QtGui import (QBrush, QColor, QFont, QImageReader, QPainter,
+                           QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGraphicsItem,
@@ -18,6 +22,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -29,9 +35,11 @@ from PySide6.QtWidgets import (
 )
 
 from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
+from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.library_view import LibraryPanel
 from wallpaper_orchestrator.platforms.windows import (
     discover_monitors,
+    get_monitor_wallpaper,
     set_monitor_wallpaper,
 )
 from wallpaper_orchestrator.profiles import (
@@ -244,6 +252,42 @@ class ImageBadge(QGraphicsRectItem):
         ]))
 
 
+class CollectionPicker(QDialog):
+    """Choose several collection subscriptions without changing panel height."""
+
+    def __init__(self, collections, selected_ids, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose Wallpaper Collections")
+        self.resize(380, 360)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("This display can rotate through these collections:"))
+        self.items = QListWidget()
+        selected = set(selected_ids)
+        for collection in collections:
+            item = QListWidgetItem(collection.name)
+            item.setData(Qt.ItemDataRole.UserRole, collection.id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if collection.id in selected
+                else Qt.CheckState.Unchecked
+            )
+            self.items.addItem(item)
+        layout.addWidget(self.items)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_ids(self) -> list[str]:
+        return [
+            item.data(Qt.ItemDataRole.UserRole)
+            for index in range(self.items.count())
+            if (item := self.items.item(index)).checkState() == Qt.CheckState.Checked
+        ]
+
+
 class MonitorTile(QGraphicsRectItem):
     """Display tile with selection handled by the parent MonitorView."""
 
@@ -258,6 +302,8 @@ class MonitorTile(QGraphicsRectItem):
         self.setData(0, name)
         self.setData(1, monitor.device_id)
         self._hovered = False
+        self._wallpaper_path = None
+        self._preview = QPixmap()
 
         self.name = QGraphicsSimpleTextItem(name, self)
         font = QFont("Segoe UI")
@@ -289,6 +335,47 @@ class MonitorTile(QGraphicsRectItem):
         self.image_badge = ImageBadge(choose_image, self)
         self.image_badge.setPos(max(20, monitor.width - 210), 20)
         self.refresh_appearance()
+
+    def set_wallpaper_preview(self, path: str | None, *, force=False):
+        """Read only a bounded thumbnail; never load the full wallpaper."""
+        if path == self._wallpaper_path and not force:
+            return
+        self._wallpaper_path = path
+        self._preview = QPixmap()
+        if path and Path(path).is_file():
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            size = reader.size()
+            if size.isValid() and size.width() * size.height() <= 80_000_000:
+                scale = min(580 / size.width(), 420 / size.height(), 1.0)
+                reader.setScaledSize(QSize(
+                    max(1, int(size.width() * scale)),
+                    max(1, int(size.height() * scale)),
+                ))
+                image = reader.read()
+                if not image.isNull():
+                    self._preview = QPixmap.fromImage(image)
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self._preview.isNull():
+            return
+        target = self.rect().adjusted(16, 16, -16, -16)
+        source = QRectF(self._preview.rect())
+        image_ratio = source.width() / source.height()
+        target_ratio = target.width() / target.height()
+        if image_ratio > target_ratio:
+            cropped_width = source.height() * target_ratio
+            source.setLeft((source.width() - cropped_width) / 2)
+            source.setWidth(cropped_width)
+        else:
+            cropped_height = source.width() / target_ratio
+            source.setTop((source.height() - cropped_height) / 2)
+            source.setHeight(cropped_height)
+        painter.drawPixmap(target, self._preview, source)
+        # Keep display name and resolution legible over bright photographs.
+        painter.fillRect(target, QColor(11, 17, 26, 135))
 
     def hoverEnterEvent(self, event):
         self._hovered = True
@@ -370,6 +457,16 @@ class WallpaperWindow(QMainWindow):
         display_caption.setObjectName("sectionLabel")
         display_row.addWidget(display_caption)
         display_row.addStretch(1)
+        self.cross_monitor_limits = QCheckBox("Cross-monitor limits")
+        self.cross_monitor_limits.setToolTip(
+            "Optional: enforce global theme_limits from config.json across "
+            "monitors. When off, eligible images are determined by the "
+            "selected collections or folders and their orientations."
+        )
+        self.cross_monitor_limits.setChecked(
+            self.settings.value("cross_monitor_limits_enabled", False, type=bool)
+        )
+        display_row.addWidget(self.cross_monitor_limits)
         self.select_all_button = QPushButton("Select all")
         self.select_all_button.setObjectName("quietButton")
         self.select_all_button.clicked.connect(self.toggle_select_all)
@@ -410,6 +507,7 @@ class WallpaperWindow(QMainWindow):
         source_row.addWidget(QLabel("Wallpaper"))
         self.source_mode = QComboBox()
         self.source_mode.addItem("Folder", "folder")
+        self.source_mode.addItem("Collections", "collections")
         self.source_mode.addItem("Fixed image", "fixed")
         source_row.addWidget(self.source_mode, 3)
         self.order_label = QLabel("Order")
@@ -450,6 +548,18 @@ class WallpaperWindow(QMainWindow):
         folder_row.addWidget(pick_folder)
         folder_row.addWidget(use_main)
         self.source_pages.addWidget(folder_page)
+
+        collection_page = QWidget()
+        collection_row = QHBoxLayout(collection_page)
+        collection_row.setContentsMargins(0, 0, 0, 0)
+        self.collection_summary = QLineEdit()
+        self.collection_summary.setReadOnly(True)
+        self.collection_summary.setPlaceholderText("No collections assigned")
+        self.choose_collections_button = QPushButton("Choose collections")
+        self.choose_collections_button.clicked.connect(self.choose_collections)
+        collection_row.addWidget(self.collection_summary, 1)
+        collection_row.addWidget(self.choose_collections_button)
+        self.source_pages.addWidget(collection_page)
         panel_layout.addWidget(self.source_pages)
 
         layout.addWidget(self.panel)
@@ -513,8 +623,10 @@ class WallpaperWindow(QMainWindow):
         # Collection subscriptions will be integrated into Displays in C1.
         self.library_panel = LibraryPanel(self)
         self.tabs.addTab(self.library_panel, "Library")
+        self.tabs.currentChanged.connect(self._tab_changed)
 
         self.source_mode.currentIndexChanged.connect(self.source_changed)
+        self.cross_monitor_limits.toggled.connect(self._limits_changed)
         self.folder_order.currentIndexChanged.connect(self.order_changed)
         self.scene.selectionChanged.connect(self.monitor_selected)
         self.view.selection_changed_handler = self.monitor_selected
@@ -534,6 +646,10 @@ class WallpaperWindow(QMainWindow):
         )
         for screen in app.screens():
             self._watch_screen(screen)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(15000)
+        self._preview_timer.timeout.connect(self.refresh_wallpaper_previews)
+        self._preview_timer.start()
         if self.monitors:
             self.monitor_items[self.monitors[0].device_id].setSelected(True)
         else:
@@ -583,6 +699,7 @@ class WallpaperWindow(QMainWindow):
             and mapping == self.mapping
         )
         if unchanged:
+            self.refresh_wallpaper_previews()
             if manual:
                 self.status.setText("Displays are up to date.")
             return
@@ -633,8 +750,28 @@ class WallpaperWindow(QMainWindow):
             self.view.fitInView(
                 self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
             )
+            self.refresh_wallpaper_previews()
         else:
             self.status.setText("No displays detected.")
+
+    def refresh_wallpaper_previews(self, force=False):
+        """Keep monitor tiles representative of the actual desktop wallpaper."""
+        for device_id, tile in self.monitor_items.items():
+            try:
+                current = get_monitor_wallpaper(device_id)
+                tile.set_wallpaper_preview(
+                    str(current) if current else None, force=force
+                )
+            except Exception:
+                # A transient disconnected monitor must not break the GUI.
+                tile.set_wallpaper_preview(None)
+
+    def _tab_changed(self, index):
+        if index == 0:
+            self.update_collection_summary()
+            self.refresh_wallpaper_previews()
+        else:
+            self.library_panel.refresh_collections()
 
     def toggle_select_all(self):
         select = len(self.selected_device_ids) != len(self.monitors)
@@ -675,6 +812,7 @@ class WallpaperWindow(QMainWindow):
                 self.source_mode.setCurrentIndex(0)
                 self.image_path.clear()
                 self.source_folder.clear()
+                self.collection_summary.clear()
                 self.folder_order.setCurrentIndex(0)
             finally:
                 self._restoring = False
@@ -694,14 +832,62 @@ class WallpaperWindow(QMainWindow):
             self.folder_order.setCurrentIndex(max(0, order_index))
         finally:
             self._restoring = False
+        self.update_collection_summary()
         self.refresh_source_controls()
 
     def refresh_source_controls(self):
-        fixed = self.source_mode.currentData() == "fixed"
-        self.source_pages.setCurrentIndex(0 if fixed else 1)
+        mode = self.source_mode.currentData()
+        fixed = mode == "fixed"
+        self.source_pages.setCurrentIndex(
+            0 if fixed else 2 if mode == "collections" else 1
+        )
         self.order_label.setEnabled(not fixed)
         self.folder_order.setEnabled(not fixed)
         self.update_action()
+
+    def update_collection_summary(self):
+        if not self.selected_device_id:
+            self.collection_summary.clear()
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                collections = catalog.list_monitor_collections(
+                    self.selected_device_id
+                )
+            self.collection_summary.setText(
+                ", ".join(collection.name for collection in collections)
+            )
+        except Exception:
+            self.collection_summary.setText("Collections unavailable")
+
+    def choose_collections(self):
+        if not self.selected_device_id:
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                collections = catalog.list_collections()
+                selected_ids = [
+                    item.id for item in catalog.list_monitor_collections(
+                        self.selected_device_id
+                    )
+                ]
+            if not collections:
+                QMessageBox.information(
+                    self, "No Collections",
+                    "Create a collection in the Library tab first."
+                )
+                return
+            picker = CollectionPicker(collections, selected_ids, self)
+            if picker.exec() != QDialog.DialogCode.Accepted:
+                return
+            with WallpaperCatalog() as catalog:
+                catalog.set_monitor_collections(
+                    self.selected_device_id, picker.selected_ids()
+                )
+            self.update_collection_summary()
+            self.update_action()
+        except Exception as error:
+            QMessageBox.critical(self, "Collection Error", str(error))
 
     def source_changed(self):
         if self._restoring:
@@ -712,6 +898,17 @@ class WallpaperWindow(QMainWindow):
     def order_changed(self):
         if not self._restoring:
             self.save_current_profile()
+
+    def _limits_changed(self, enabled):
+        """Persist an explicit opt-in to legacy cross-monitor theme limits."""
+        self.settings.setValue("cross_monitor_limits_enabled", enabled)
+        self.settings.sync()
+        self.status.setText(
+            "Cross-monitor limits enabled: configured theme caps now apply."
+            if enabled else
+            "Cross-monitor limits disabled: collections and orientation "
+            "determine eligible wallpapers."
+        )
 
     def save_current_profile(self):
         if self._restoring or not self.selected_device_id:
@@ -772,15 +969,29 @@ class WallpaperWindow(QMainWindow):
                 self.profiles.get(device_id, {}).get("mode") == "fixed"
                 for device_id in ids
             )
-            folders_valid = all(
-                self.folder_for(device_id)
-                and Path(self.folder_for(device_id)).is_dir()
-                for device_id in ids
-            )
-            valid = not has_fixed and folders_valid
+            valid_sources = True
+            try:
+                collection_ids = [
+                    device_id for device_id in ids
+                    if self.profiles.get(device_id, {}).get("mode") == "collections"
+                ]
+                for device_id in ids:
+                    if device_id not in collection_ids:
+                        folder = self.folder_for(device_id)
+                        if not folder or not Path(folder).is_dir():
+                            valid_sources = False
+                if collection_ids:
+                    with WallpaperCatalog() as catalog:
+                        if any(not catalog.list_monitor_collections(device_id)
+                               for device_id in collection_ids):
+                            valid_sources = False
+            except Exception:
+                valid_sources = False
+            valid = not has_fixed and valid_sources
             hint = (
                 "Fixed-image displays cannot be shuffled" if has_fixed
-                else "Choose a wallpaper folder first" if not folders_valid else ""
+                else "Choose a valid folder or assign collections first"
+                if not valid_sources else ""
             )
 
         self.action_button.setEnabled(valid)
@@ -837,6 +1048,7 @@ class WallpaperWindow(QMainWindow):
         finally:
             self.scene.blockSignals(False)
         self.monitor_selected()
+        self.refresh_wallpaper_previews(force=True)
         self.status.setText(f"Applied {Path(filename).name}.")
 
     def choose_monitor_folder(self):
@@ -869,6 +1081,7 @@ class WallpaperWindow(QMainWindow):
                 assignments, device_ids = create_profile_plan(
                     Path(shared) if shared else None, self.profiles,
                     selected_device_ids=ids,
+                    respect_theme_limits=self.cross_monitor_limits.isChecked(),
                 )
                 apply_plan(assignments, device_ids)
                 for device_id, wallpaper in assignments.items():
@@ -886,10 +1099,11 @@ class WallpaperWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Wallpaper Error", str(error))
             return
+        self.refresh_wallpaper_previews(force=True)
         self.status.setText(result)
 
     def closeEvent(self, event):
-        """Keep the scan worker alive until its database update completes."""
+        """Let scans finish before closing, then stop folder monitoring."""
         if self.library_panel.scan_running():
             QMessageBox.information(
                 self, "Library Scan Running",
@@ -897,6 +1111,7 @@ class WallpaperWindow(QMainWindow):
             )
             event.ignore()
             return
+        self.library_panel.stop_watching()
         super().closeEvent(event)
 
 
