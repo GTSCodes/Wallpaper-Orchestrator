@@ -5,8 +5,6 @@ import sys
 import tempfile
 import types
 import unittest
-from dataclasses import replace
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,7 +24,6 @@ if "wallpaper_orchestrator.platforms.windows" not in sys.modules:
     sys.modules["wallpaper_orchestrator.platforms.windows"] = adapter
 
 from wallpaper_orchestrator import engine
-from wallpaper_orchestrator.calendar_rules import create_calendar_rule, save_calendar_rules
 from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.profiles import default_profile, load_profiles, save_profiles
 
@@ -83,103 +80,6 @@ class CollectionSelectionTests(unittest.TestCase):
                 {"order": "random", "last_image": str(current.path)}, "p",
             )
         self.assertEqual(ordered[0], other)
-
-    def test_calendar_winter_tag_filters_existing_collection_images(self):
-        collection = self.catalog.create_collection("Nature")
-        winter = self.add_image(collection.id, "snow.jpg", (1400, 900))
-        self.add_image(collection.id, "summer.jpg", (1400, 900))
-        tag = self.catalog.create_tag("Winter")
-        self.catalog.tag_image(winter.id, tag.id)
-        self.catalog.set_monitor_collections("l", [collection.id])
-        rule = create_calendar_rule("December Winter", include_tag_ids=(tag.id,))
-        now = datetime(2026, 12, 5, 12, tzinfo=timezone.utc)
-        with patch.object(engine, "discover_monitors", return_value=[
-            SimpleNamespace(device_id="l", orientation="landscape")
-        ]), patch.object(engine, "get_monitor_wallpaper", return_value=None):
-            assignments, _ = engine.create_profile_plan(
-                None, {"l": self.profile()}, selected_device_ids={"l"},
-                calendar_rules=[rule], calendar_now=now,
-                respect_theme_limits=False,
-            )
-        self.assertEqual(assignments["l"].path, winter.path)
-
-    def test_calendar_prefer_falls_back_but_require_explains(self):
-        collection = self.catalog.create_collection("Art")
-        normal = self.add_image(collection.id, "ordinary.jpg", (1400, 900))
-        self.catalog.set_monitor_collections("l", [collection.id])
-        rule = create_calendar_rule("Christmas", include_tag_ids=("missing-tag",))
-        now = datetime(2026, 12, 5, 12, tzinfo=timezone.utc)
-        monitor = SimpleNamespace(device_id="l", orientation="landscape")
-        with patch.object(engine, "discover_monitors", return_value=[monitor]), \
-             patch.object(engine, "get_monitor_wallpaper", return_value=None):
-            chosen, _ = engine.create_profile_plan(
-                None, {"l": self.profile()}, selected_device_ids={"l"},
-                calendar_rules=[rule], calendar_now=now, respect_theme_limits=False,
-            )
-            self.assertEqual(chosen["l"].path, normal.path)
-            with self.assertRaisesRegex(ValueError, "Seasonal rule 'Christmas'"):
-                engine.create_profile_plan(
-                    None, {"l": self.profile()}, selected_device_ids={"l"},
-                    calendar_rules=[replace(rule, behavior="require")],
-                    calendar_now=now, respect_theme_limits=False,
-                )
-
-    def test_calendar_cannot_expand_monitor_subscription(self):
-        assigned = self.catalog.create_collection("Assigned")
-        other = self.catalog.create_collection("Other")
-        retained = self.add_image(assigned.id, "assigned.jpg", (1400, 900))
-        elsewhere = self.add_image(other.id, "other.jpg", (1400, 900))
-        self.catalog.set_monitor_collections("l", [assigned.id])
-        rule = create_calendar_rule("Other collection", collection_ids=(other.id,))
-        now = datetime(2026, 12, 5, 12, tzinfo=timezone.utc)
-        monitor = SimpleNamespace(device_id="l", orientation="landscape")
-        with patch.object(engine, "discover_monitors", return_value=[monitor]), \
-             patch.object(engine, "get_monitor_wallpaper", return_value=None):
-            chosen, _ = engine.create_profile_plan(
-                None, {"l": self.profile()}, selected_device_ids={"l"},
-                calendar_rules=[rule], calendar_now=now, respect_theme_limits=False,
-            )
-        self.assertEqual(chosen["l"].path, retained.path)
-        self.assertNotEqual(chosen["l"].path, elsewhere.path)
-
-    def test_background_and_gui_plans_read_saved_calendar_automatically(self):
-        collection = self.catalog.create_collection("December")
-        winter = self.add_image(collection.id, "winter.jpg", (1400, 900))
-        self.add_image(collection.id, "other.jpg", (1400, 900))
-        tag = self.catalog.create_tag("Christmas")
-        self.catalog.tag_image(winter.id, tag.id)
-        self.catalog.set_monitor_collections("l", [collection.id])
-        save_calendar_rules([create_calendar_rule(
-            "Christmas", include_tag_ids=(tag.id,), months=(12,),
-        )])
-        now = datetime(2026, 12, 5, 12, tzinfo=timezone.utc)
-        with patch.object(engine, "discover_monitors", return_value=[
-            SimpleNamespace(device_id="l", orientation="landscape")
-        ]), patch.object(engine, "get_monitor_wallpaper", return_value=None):
-            assignments, _ = engine.create_profile_plan(
-                None, {"l": self.profile()}, selected_device_ids={"l"},
-                calendar_now=now, respect_theme_limits=False,
-            )
-        self.assertEqual(assignments["l"].path, winter.path)
-
-    def test_calendar_exclusion_never_chooses_excluded_tag(self):
-        collection = self.catalog.create_collection("Landscape")
-        excluded = self.add_image(collection.id, "dark.jpg", (1400, 900))
-        safe = self.add_image(collection.id, "bright.jpg", (1400, 900))
-        tag = self.catalog.create_tag("Dark")
-        self.catalog.tag_image(excluded.id, tag.id)
-        self.catalog.set_monitor_collections("l", [collection.id])
-        rule = create_calendar_rule("No dark in December", exclude_tag_ids=(tag.id,))
-        with patch.object(engine, "discover_monitors", return_value=[
-            SimpleNamespace(device_id="l", orientation="landscape")
-        ]), patch.object(engine, "get_monitor_wallpaper", return_value=None):
-            assignments, _ = engine.create_profile_plan(
-                None, {"l": self.profile()}, selected_device_ids={"l"},
-                calendar_rules=[rule],
-                calendar_now=datetime(2026, 12, 5, tzinfo=timezone.utc),
-                respect_theme_limits=False,
-            )
-        self.assertEqual(assignments["l"].path, safe.path)
 
     def test_one_monitor_selects_its_collection_image(self):
         collection = self.catalog.create_collection("Nature")

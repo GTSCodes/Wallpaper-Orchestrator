@@ -42,6 +42,7 @@ if __name__ == "__main__":
     _startup_sys.excepthook = _report_unhandled_error
 
 import ctypes
+from dataclasses import replace
 from datetime import datetime
 import json
 import os
@@ -56,10 +57,14 @@ from wallpaper_orchestrator.automation import (
     record_interval_results, resolve_interval_targets, save_automation,
 )
 from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.calendar_rules import load_calendar_rules
 from wallpaper_orchestrator.indexer import scan_folder
 from wallpaper_orchestrator.profiles import load_profiles, save_profiles
 from wallpaper_orchestrator.scheduler import (
     due_rules, load_schedules, resolve_targets, save_schedules, stamp_attempts,
+)
+from wallpaper_orchestrator.seasonal_automation import (
+    SeasonDecision, evaluate_seasons, load_seasonal_state, save_seasonal_state,
 )
 from wallpaper_orchestrator.watcher import FolderChangeDetector
 
@@ -131,6 +136,29 @@ def start_agent() -> None:
         creationflags=(subprocess.DETACHED_PROCESS |
                        subprocess.CREATE_NEW_PROCESS_GROUP),
     )
+
+
+def set_background_enabled(enabled: bool) -> None:
+    """Explicit global opt-in shared by interval, daily and seasonal rules."""
+    if type(enabled) is not bool:
+        raise ValueError("Background preference must be a boolean")
+    original = load_automation()
+    try:
+        if enabled:
+            install_startup()
+        save_automation(replace(original, background_enabled=enabled))
+        if enabled:
+            start_agent()  # Singleton mutex prevents duplicate running agents.
+        else:
+            uninstall_startup()
+    except Exception:
+        try:
+            save_automation(original)
+            if not original.background_enabled:
+                uninstall_startup()
+        except Exception:
+            pass
+        raise
 
 
 def status_path() -> Path:
@@ -291,7 +319,7 @@ def _run_cycle(detector, pending_ids: set[str]) -> str | None:
 
 
 def _apply_due_automations() -> str | None:
-    """Execute due daily and interval rules in one coordinated engine plan."""
+    """Execute daily, interval and seasonal triggers in one coordinated plan."""
     from PySide6.QtCore import QSettings
     from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
     from wallpaper_orchestrator.platforms.windows import discover_monitors
@@ -301,20 +329,43 @@ def _apply_due_automations() -> str | None:
     config = load_automation()
     daily = due_rules(load_schedules(), moment)
     intervals = due_intervals(config, epoch)
-    if not daily and not intervals:
-        return None
+    seasons = load_calendar_rules()
+    season_error = None
+    try:
+        previous_seasons = load_seasonal_state()
+    except (OSError, ValueError) as error:
+        previous_seasons = {}
+        season_error = f"Seasonal triggers paused: {error}"
+    if not daily and not intervals and not seasons and not previous_seasons:
+        return season_error
 
     profiles = load_profiles()  # Live order and sources, never cached.
     active = {monitor.device_id for monitor in discover_monitors()}
     if not active:
         return "Waiting for an active Windows display session."
+    season_decision = SeasonDecision(frozenset(), previous_seasons, ())
+    if not season_error:
+        season_decision = evaluate_seasons(
+            seasons, active, moment, epoch=epoch, previous=previous_seasons,
+        )
+        if season_decision.new_states != previous_seasons:
+            try:
+                # Stamp before applying: crashes/restarts must not replay events.
+                save_seasonal_state(season_decision.new_states)
+            except (OSError, ValueError) as error:
+                season_error = f"Seasonal triggers paused: {error}"
+                season_decision = SeasonDecision(frozenset(), previous_seasons, ())
+    if not daily and not intervals and not season_decision.target_ids:
+        return season_error
     daily_targets = resolve_targets(daily, active, profiles)
     interval_targets = resolve_interval_targets(intervals, active, profiles)
-    targets = set(daily_targets.device_ids) | set(interval_targets.device_ids)
+    season_targets = {mid for mid in season_decision.target_ids
+                      if profiles.get(mid, {}).get("mode", "folder") != "fixed"}
+    targets = set(daily_targets.device_ids) | set(interval_targets.device_ids) | season_targets
 
     daily_ids = set(daily_targets.attempted_ids)
     interval_ids = set(interval_targets.attempted_ids)
-    if not daily_ids and not interval_ids:
+    if not daily_ids and not interval_ids and not season_decision.target_ids:
         return "Waiting for a disconnected automation display."
 
     # Mark attempts *before* applying. A crash, reboot, or repeated DST hour
@@ -352,7 +403,7 @@ def _apply_due_automations() -> str | None:
         save_schedules(stamp_attempts(load_schedules(), daily_ids, moment, result))
     if interval_ids:
         save_automation(record_interval_results(load_automation(), interval_ids, result))
-    return result
+    return f"{result} | {season_error}" if season_error else result
 
 
 def main() -> int:

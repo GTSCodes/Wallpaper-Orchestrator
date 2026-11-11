@@ -15,6 +15,7 @@ from wallpaper_orchestrator.scheduler import (
     record_manual_result, save_schedules, stamp_attempts,
 )
 from wallpaper_orchestrator.calendar_view import CalendarRulesDialog
+from wallpaper_orchestrator.automation_manager_view import AutomationManagerDialog
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -144,11 +145,13 @@ class SchedulesPanel(QWidget):
         self.remove_button = QPushButton("Delete")
         self.run_button = QPushButton("Run now")
         self.calendar_button = QPushButton("Seasonal rules…")
+        self.automation_centre_button = QPushButton("Manage all automations…")
         actions.addWidget(self.add_button)
         actions.addWidget(self.edit_button)
         actions.addWidget(self.remove_button)
         actions.addStretch(1)
         actions.addWidget(self.calendar_button)
+        actions.addWidget(self.automation_centre_button)
         actions.addWidget(self.run_button)
         layout.addLayout(actions)
 
@@ -193,6 +196,7 @@ class SchedulesPanel(QWidget):
         self.remove_button.clicked.connect(self._remove)
         self.run_button.clicked.connect(self._run_now)
         self.calendar_button.clicked.connect(self._open_calendar_rules)
+        self.automation_centre_button.clicked.connect(self._open_automation_centre)
         self.table.itemSelectionChanged.connect(self._buttons)
         self._refresh()
 
@@ -303,6 +307,10 @@ class SchedulesPanel(QWidget):
     def _open_calendar_rules(self):
         """Keep the Schedules tab compact while exposing advanced filters."""
         CalendarRulesDialog(self.monitors, self.mapping, self).exec()
+
+    def _open_automation_centre(self):
+        AutomationManagerDialog(self.monitors, self.mapping, self).exec()
+        self.reload_results()
 
     def get_due(self, now: datetime) -> list[ScheduleRule]:
         return due_rules(self.rules, now) if self._load_error is None else []

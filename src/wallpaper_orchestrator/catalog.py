@@ -18,9 +18,10 @@ from wallpaper_orchestrator.catalog_models import (
     ImageRecord,
     Tag,
 )
+from wallpaper_orchestrator.intelligence import load_smart_collections, save_smart_collections
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def default_catalog_path() -> Path:
@@ -101,7 +102,22 @@ class WallpaperCatalog:
         if version == SCHEMA_VERSION:
             return
 
-        # A fresh database only. Future migrations will branch on user_version.
+        if version == 1:
+            # C6 additive migration. Original collection, image and tag IDs
+            # are preserved; no image files or existing associations change.
+            self._db.executescript("""
+                BEGIN IMMEDIATE;
+                CREATE TABLE folder_tag_defaults (
+                    folder_link_id TEXT NOT NULL REFERENCES folder_links(id) ON DELETE CASCADE,
+                    tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                    PRIMARY KEY (folder_link_id, tag_id)
+                );
+                PRAGMA user_version = 2;
+                COMMIT;
+            """)
+            return
+
+        # Fresh catalogue. Other versions above were rejected explicitly.
         self._db.executescript("""
             BEGIN IMMEDIATE;
             CREATE TABLE collections (
@@ -160,6 +176,12 @@ class WallpaperCatalog:
                     ON DELETE CASCADE,
                 PRIMARY KEY (monitor_id, collection_id)
             );
+            CREATE TABLE folder_tag_defaults (
+                folder_link_id TEXT NOT NULL REFERENCES folder_links(id)
+                    ON DELETE CASCADE,
+                tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (folder_link_id, tag_id)
+            );
             CREATE INDEX idx_folder_links_collection
                 ON folder_links(collection_id);
             CREATE INDEX idx_folder_images_image ON folder_images(image_id);
@@ -167,7 +189,7 @@ class WallpaperCatalog:
                 ON manual_collection_images(image_id);
             CREATE INDEX idx_monitor_collections_collection
                 ON monitor_collections(collection_id);
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             COMMIT;
         """)
 
@@ -199,8 +221,12 @@ class WallpaperCatalog:
 
     def delete_collection(self, collection_id: str) -> None:
         """Remove catalogue relationships, never the referenced image files."""
+        specs = load_smart_collections()  # Validate external policy before DB mutation.
         with self._db:
             self._db.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+        if collection_id in specs:
+            del specs[collection_id]
+            save_smart_collections(specs)
 
     def list_collections(self) -> list[Collection]:
         rows = self._db.execute(
@@ -257,6 +283,84 @@ class WallpaperCatalog:
             raise KeyError(f"Unknown folder link: {folder_link_id}")
         return FolderLink(row["id"], row["collection_id"], Path(row["path"]),
                           bool(row["recursive"]))
+
+    def list_folder_default_tags(self, folder_link_id: str) -> list[Tag]:
+        """Tags applied automatically to every image indexed through a link."""
+        rows = self._db.execute("""
+            SELECT t.id, t.name FROM tags AS t
+            JOIN folder_tag_defaults AS d ON d.tag_id = t.id
+            WHERE d.folder_link_id = ? ORDER BY t.name_key
+        """, (folder_link_id,))
+        return [Tag(row["id"], row["name"]) for row in rows]
+
+    def set_folder_default_tags(self, folder_link_id: str, tag_ids: Iterable[str]) -> None:
+        """Replace folder defaults and tag currently linked images atomically.
+
+        Removing a default does *not* remove any previously assigned image tags.
+        That would also remove manually assigned labels on shared images.
+        """
+        ids = tuple(dict.fromkeys(tag_ids))
+        if any(not isinstance(value, str) or not value for value in ids):
+            raise ValueError("Folder defaults require valid tag IDs")
+        try:
+            with self._db:
+                if not self._db.execute(
+                    "SELECT 1 FROM folder_links WHERE id = ?", (folder_link_id,)
+                ).fetchone():
+                    raise KeyError(f"Unknown folder link: {folder_link_id}")
+                self._db.execute("DELETE FROM folder_tag_defaults WHERE folder_link_id = ?",
+                                 (folder_link_id,))
+                self._db.executemany(
+                    "INSERT INTO folder_tag_defaults VALUES (?, ?)",
+                    [(folder_link_id, tid) for tid in ids],
+                )
+                self._db.executemany("""
+                    INSERT OR IGNORE INTO image_tags (image_id, tag_id)
+                    SELECT image_id, ? FROM folder_images WHERE folder_link_id = ?
+                """, [(tid, folder_link_id) for tid in ids])
+        except sqlite3.IntegrityError as error:
+            raise ValueError(f"Cannot set folder default tags: {error}") from error
+
+    def tag_images(self, image_ids: Iterable[str], tag_ids: Iterable[str]) -> None:
+        """Batch-label many images, all-or-nothing if an ID is invalid."""
+        unique_images = tuple(dict.fromkeys(image_ids))
+        unique_tags = tuple(dict.fromkeys(tag_ids))
+        pairs = [(image_id, tag_id) for image_id in unique_images
+                 for tag_id in unique_tags]
+        try:
+            with self._db:
+                self._db.executemany("INSERT OR IGNORE INTO image_tags VALUES (?, ?)", pairs)
+        except sqlite3.IntegrityError as error:
+            raise ValueError(f"Cannot tag images: {error}") from error
+
+    def untag_images(self, image_ids: Iterable[str], tag_ids: Iterable[str]) -> None:
+        unique_images = tuple(dict.fromkeys(image_ids))
+        unique_tags = tuple(dict.fromkeys(tag_ids))
+        pairs = [(image_id, tag_id) for image_id in unique_images
+                 for tag_id in unique_tags]
+        with self._db:
+            self._db.executemany(
+                "DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?", pairs,
+            )
+
+    def list_image_tag_ids(self, image_ids: Iterable[str]) -> dict[str, set[str]]:
+        """Read tag filters in batches without one SQL query per image."""
+        ids = tuple(dict.fromkeys(image_ids))
+        result = {image_id: set() for image_id in ids}
+        for start in range(0, len(ids), 400):
+            group = ids[start:start + 400]
+            placeholders = ",".join("?" for _ in group)
+            for row in self._db.execute(
+                f"SELECT image_id, tag_id FROM image_tags WHERE image_id IN ({placeholders})",
+                group,
+            ):
+                result[row["image_id"]].add(row["tag_id"])
+        return result
+
+    def list_all_images(self) -> list[ImageRecord]:
+        return [_image_from_row(row) for row in self._db.execute(
+            "SELECT * FROM images ORDER BY path_key"
+        )]
 
     def upsert_image(
         self, path: str | Path, *, width: int, height: int,
@@ -417,6 +521,13 @@ class WallpaperCatalog:
                 "INSERT OR IGNORE INTO folder_images VALUES (?, ?)",
                 [(folder_link_id, image_id) for image_id in seen],
             )
+            self._db.execute("""
+                INSERT OR IGNORE INTO image_tags (image_id, tag_id)
+                SELECT fi.image_id, d.tag_id
+                FROM folder_images AS fi
+                JOIN folder_tag_defaults AS d ON d.folder_link_id = fi.folder_link_id
+                WHERE fi.folder_link_id = ?
+            """, (folder_link_id,))
             self._db.executemany(
                 "UPDATE images SET available = 0 WHERE id = ?",
                 [(image_id,) for image_id in invalid | unavailable],
@@ -453,7 +564,22 @@ class WallpaperCatalog:
                ) ORDER BY path_key""",
             (collection_id, collection_id),
         )
-        return [_image_from_row(row) for row in rows]
+        records = {}
+        for row in rows:
+            record = _image_from_row(row)
+            records[record.id] = record
+        # Smart collections are virtual: indexed images can match regardless
+        # of their physical folder or current ordinary collection membership.
+        spec = load_smart_collections().get(collection_id)
+        if spec:
+            tags_by_image = {}
+            for row in self._db.execute("SELECT image_id, tag_id FROM image_tags"):
+                tags_by_image.setdefault(row["image_id"], set()).add(row["tag_id"])
+            for row in self._db.execute("SELECT * FROM images ORDER BY path_key"):
+                record = _image_from_row(row)
+                if spec.matches(tags_by_image.get(record.id, set())):
+                    records[record.id] = record
+        return sorted(records.values(), key=lambda record: str(record.path).casefold())
 
     def list_image_collections(self, image_id: str) -> list[Collection]:
         rows = self._db.execute(
@@ -467,7 +593,15 @@ class WallpaperCatalog:
                ) ORDER BY name_key""",
             (image_id, image_id),
         )
-        return [Collection(row["id"], row["name"]) for row in rows]
+        collections = {row["id"]: Collection(row["id"], row["name"]) for row in rows}
+        specs = load_smart_collections()
+        if specs:
+            tags = {tag.id for tag in self.list_image_tags(image_id)}
+            for collection in self.list_collections():
+                spec = specs.get(collection.id)
+                if spec and spec.matches(tags):
+                    collections[collection.id] = collection
+        return sorted(collections.values(), key=lambda collection: collection.name.casefold())
 
     def create_tag(self, name: str) -> Tag:
         display, key = _normalised_name(name)

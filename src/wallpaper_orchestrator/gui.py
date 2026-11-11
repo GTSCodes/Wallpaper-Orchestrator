@@ -48,6 +48,7 @@ from wallpaper_orchestrator.background import (
 )
 from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.library_view import LibraryPanel
+from wallpaper_orchestrator.intelligence_view import IntelligenceDialog
 from wallpaper_orchestrator.schedule_view import SchedulesPanel
 from wallpaper_orchestrator.scheduler import resolve_targets
 from wallpaper_orchestrator.platforms.windows import (
@@ -481,6 +482,14 @@ class WallpaperWindow(QMainWindow):
             self.settings.value("cross_monitor_limits_enabled", False, type=bool)
         )
         display_row.addWidget(self.cross_monitor_limits)
+        self.intelligence_button = QPushButton("Selection rules…")
+        self.intelligence_button.setObjectName("quietButton")
+        self.intelligence_button.setToolTip(
+            "Configure recent-image history, collection/tag limits, monitor "
+            "groups and smart collections."
+        )
+        self.intelligence_button.clicked.connect(self.configure_intelligence)
+        display_row.addWidget(self.intelligence_button)
         self.automate_button = QPushButton("Automate")
         self.automate_button.setObjectName("quietButton")
         self.automate_button.setToolTip(
@@ -1021,6 +1030,17 @@ class WallpaperWindow(QMainWindow):
             )
             if dialog.run_now.isChecked():
                 self.change_selection()
+
+    def configure_intelligence(self):
+        """Keep C5's advanced controls in one dedicated dialog."""
+        try:
+            dialog = IntelligenceDialog(self.monitors, self.mapping, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.library_panel.refresh_collections()
+                self.update_collection_summary()
+                self.status.setText("Intelligent selection rules saved for the next shuffle.")
+        except (ValueError, OSError) as error:
+            QMessageBox.critical(self, "Selection Rules", str(error))
 
     def toggle_select_all(self):
         select = len(self.selected_device_ids) != len(self.monitors)

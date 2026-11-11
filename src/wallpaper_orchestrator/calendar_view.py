@@ -195,11 +195,33 @@ class CalendarRuleEditor(QDialog):
         self.behavior.setCurrentIndex(0 if not existing or existing.behavior == "prefer" else 1)
         form.addRow("No matching images", self.behavior)
 
+        self.apply_on_start = QCheckBox("Change the target wallpapers when this rule becomes active")
+        self.apply_on_start.setChecked(existing.apply_on_start if existing else True)
+        form.addRow("At season start", self.apply_on_start)
+        self.apply_on_end = QCheckBox("Change the target wallpapers when this rule ends")
+        self.apply_on_end.setChecked(existing.apply_on_end if existing else True)
+        form.addRow("At season end", self.apply_on_end)
+        self.seasonal_interval = QComboBox()
+        for name, seconds in (
+            ("No additional interval (follow normal automations)", 0),
+            ("Every minute", 60), ("Every 15 minutes", 900),
+            ("Every 30 minutes", 1800), ("Every hour", 3600),
+            ("Every 6 hours", 21600), ("Daily", 86400),
+        ):
+            self.seasonal_interval.addItem(name, seconds)
+        selected = existing.shuffle_interval_seconds if existing else 0
+        index = self.seasonal_interval.findData(selected)
+        if index < 0:
+            self.seasonal_interval.addItem(f"Every {selected} seconds (saved)", selected)
+            index = self.seasonal_interval.count() - 1
+        self.seasonal_interval.setCurrentIndex(index)
+        form.addRow("While season active", self.seasonal_interval)
+
         note = QLabel(
             "Rules only filter wallpapers already eligible from each monitor's "
             "current folders/collections and orientation. They do not move files, "
-            "change subscriptions or trigger a wallpaper change by themselves. "
-            "They take effect on the next manual, interval or daily update. "
+            "change subscriptions. Start/end and recurring changes are optional; "
+            "otherwise rules take effect on the next manual, interval or daily update. "
             "At equal priority a display-specific rule wins."
         )
         note.setWordWrap(True)
@@ -247,6 +269,9 @@ class CalendarRuleEditor(QDialog):
             include_tag_ids=_selected_ids(self.include_tags),
             exclude_tag_ids=_selected_ids(self.exclude_tags),
             behavior=self.behavior.currentData(),
+            apply_on_start=self.apply_on_start.isChecked(),
+            apply_on_end=self.apply_on_end.isChecked(),
+            shuffle_interval_seconds=self.seasonal_interval.currentData(),
         )
         return replace(rule, id=self.existing.id) if self.existing else rule
 
@@ -280,8 +305,9 @@ class CalendarRulesDialog(QDialog):
         outer.addWidget(title)
         explanation = QLabel(
             "Use calendar dates, weekdays, local times and tags to filter what "
-            "each display may show. Your existing Automate intervals and daily "
-            "schedules determine when changes happen."
+            "each display may show. Optionally apply at season start/end and "
+            "set an additional seasonal interval; normal Automate intervals "
+            "and daily schedules continue to work."
         )
         explanation.setWordWrap(True)
         explanation.setStyleSheet("color: #aab8ca;")

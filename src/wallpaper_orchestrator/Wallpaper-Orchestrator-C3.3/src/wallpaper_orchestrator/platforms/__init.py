@@ -1,1 +1,0 @@
-"""Operating-system integrations for Wallpaper Orchestrator."""

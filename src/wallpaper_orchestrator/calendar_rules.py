@@ -1,7 +1,7 @@
-"""C4: durable, local-time seasonal selection policies (no Qt or Windows).
+"""C4/C5: durable, local-time seasonal selection policies (no Qt or Windows).
 
-Calendar rules do not trigger wallpaper changes. Existing manual/interval/daily
-triggers consult the active policy when selecting images for each monitor.
+All wallpaper updates consult the highest-priority active calendar policy.
+Optional C5 start/end/periodic triggers are processed by seasonal_automation.
 """
 
 from dataclasses import dataclass
@@ -68,6 +68,10 @@ class CalendarRule:
     include_tag_ids: tuple[str, ...] = ()
     exclude_tag_ids: tuple[str, ...] = ()
     behavior: str = "prefer"  # prefer => fall back; require => explain failure.
+    # C5 triggers are optional; pre-C5 rules retain their passive behaviour.
+    apply_on_start: bool = False
+    apply_on_end: bool = False
+    shuffle_interval_seconds: int = 0  # 0 follows ordinary automations only.
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not self.id.strip():
@@ -108,6 +112,12 @@ class CalendarRule:
             raise ValueError("Time window must have different start and end times.")
         if self.behavior not in {"prefer", "require"}:
             raise ValueError("Behavior must be prefer or require.")
+        if type(self.apply_on_start) is not bool or type(self.apply_on_end) is not bool:
+            raise ValueError("Seasonal trigger flags must be boolean.")
+        if (type(self.shuffle_interval_seconds) is not int
+                or self.shuffle_interval_seconds not in {0} and
+                not 60 <= self.shuffle_interval_seconds <= 604800):
+            raise ValueError("Seasonal interval must be 0 or 60–604800 seconds.")
 
     def to_dict(self) -> dict:
         return {
@@ -121,6 +131,9 @@ class CalendarRule:
             "include_tag_ids": list(self.include_tag_ids),
             "exclude_tag_ids": list(self.exclude_tag_ids),
             "behavior": self.behavior,
+            "apply_on_start": self.apply_on_start,
+            "apply_on_end": self.apply_on_end,
+            "shuffle_interval_seconds": self.shuffle_interval_seconds,
         }
 
 
