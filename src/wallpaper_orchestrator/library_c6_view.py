@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
@@ -27,6 +27,22 @@ class _FileDropMixin:
     def _setup_drop(self):
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        # Icon-mode QListWidget can handle its viewport's drag events before
+        # our widget overrides. Intercept external files at the viewport.
+        if watched is self.viewport():
+            kind = event.type()
+            if kind in (QEvent.Type.DragEnter, QEvent.Type.DragMove,
+                        QEvent.Type.Drop):
+                paths = self._incoming(event)
+                if paths:
+                    if kind == QEvent.Type.Drop:
+                        self.files_dropped.emit(paths)
+                    event.acceptProposedAction()
+                    return True
+        return super().eventFilter(watched, event)
 
     @staticmethod
     def _incoming(event):
@@ -70,6 +86,9 @@ class ImageDropGrid(_FileDropMixin, QListWidget):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDragEnabled(False)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
         self._setup_drop()
 
 

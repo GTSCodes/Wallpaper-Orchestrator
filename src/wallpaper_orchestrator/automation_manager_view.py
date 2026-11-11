@@ -110,6 +110,12 @@ class AutomationManagerDialog(QDialog):
         background_row.addWidget(self.background_choice)
         background_row.addWidget(self.background_save)
         layout.addLayout(background_row)
+        self.pause_all = QPushButton("Pause all automations")
+        self.pause_all.setToolTip(
+            "Pause every interval, daily and seasonal trigger without removing rules. "
+            "Manual wallpaper changes still work."
+        )
+        layout.addWidget(self.pause_all)
         note = QLabel(
             "All interval, daily and seasonal rules appear here. Shared monitors are not "
             "automatically conflicts: due events are combined. Warnings identify overlapping "
@@ -150,6 +156,7 @@ class AutomationManagerDialog(QDialog):
         layout.addWidget(close)
         self.refresh_button.clicked.connect(self.refresh)
         self.background_save.clicked.connect(self._configure_background)
+        self.pause_all.clicked.connect(self._toggle_global_pause)
         self.edit_button.clicked.connect(self._edit)
         self.toggle_button.clicked.connect(self._toggle)
         self.delete_button.clicked.connect(self._delete)
@@ -190,6 +197,9 @@ class AutomationManagerDialog(QDialog):
             return
         self.health.setText(f"Background agent: {agent_health_text()}")
         self.background_choice.setChecked(self.config.background_enabled)
+        self.pause_all.setText(
+            "Resume all automations" if self.config.paused else "Pause all automations"
+        )
         entries = inventory(self.intervals, self.daily, self.seasons)
         active = {m.device_id for m in self.monitors}
         self.overlaps = find_overlaps(entries, active, seasons=self.seasons)
@@ -346,4 +356,12 @@ class AutomationManagerDialog(QDialog):
             set_background_enabled(desired)
         except Exception as error:
             QMessageBox.critical(self, "Background automation", str(error))
+        self.refresh()
+
+    def _toggle_global_pause(self):
+        try:
+            current = load_automation()
+            save_automation(replace(current, paused=not current.paused))
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Pause automations", str(error))
         self.refresh()

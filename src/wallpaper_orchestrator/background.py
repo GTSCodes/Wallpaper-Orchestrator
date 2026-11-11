@@ -251,6 +251,7 @@ def diagnostic_lines(*, now: float | None = None) -> list[str]:
     config = load_automation()
     lines = [
         f"Background enabled: {config.background_enabled}",
+        f"Automation paused: {config.paused}",
         f"Agent: {agent_health_text(now=moment)}",
         f"Saved interval rules: {len(config.rules)}",
     ]
@@ -320,13 +321,15 @@ def _run_cycle(detector, pending_ids: set[str]) -> str | None:
 
 def _apply_due_automations() -> str | None:
     """Execute daily, interval and seasonal triggers in one coordinated plan."""
+    config = load_automation()
+    if config.paused:
+        return "Automations paused by user."
     from PySide6.QtCore import QSettings
     from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
     from wallpaper_orchestrator.platforms.windows import discover_monitors
 
     moment = datetime.now().astimezone()
     epoch = time.time()
-    config = load_automation()
     daily = due_rules(load_schedules(), moment)
     intervals = due_intervals(config, epoch)
     seasons = load_calendar_rules()

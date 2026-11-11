@@ -282,6 +282,11 @@ class LibraryPanel(QWidget):
         self.grid.setGridSize(QSize(164, 158))
         self.grid.setSpacing(8)
         self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Re-assert drop-only *after* setting icon mode; some Qt styles change
+        # the list view's drag/drop policy as part of the view-mode switch.
+        self.grid.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.grid.setAcceptDrops(True)
+        self.grid.viewport().setAcceptDrops(True)
         self.grid.itemSelectionChanged.connect(self._image_changed)
         self.image_views = QStackedWidget()
         self.image_views.addWidget(self.images)
@@ -1044,12 +1049,13 @@ class LibraryPanel(QWidget):
         monitors = getattr(host, "monitors", [])
         roles = {mid: role for role, mid in getattr(host, "mapping", {}).items()}
         menu = QMenu(self)
-        submenu = menu.addMenu("Apply to display")
-        for monitor in monitors:
-            if monitor.orientation != image.orientation:
-                continue
+        compatible = [monitor for monitor in monitors
+                      if monitor.orientation == image.orientation]
+        submenu = menu if len(compatible) == 1 else menu.addMenu("Apply to display")
+        for monitor in compatible:
             label = roles.get(monitor.device_id, monitor.orientation)
-            action = submenu.addAction(f"{label} ({monitor.width} × {monitor.height})")
+            prefix = "Apply to " if len(compatible) == 1 else ""
+            action = submenu.addAction(f"{prefix}{label} ({monitor.width} × {monitor.height})")
             action.triggered.connect(
                 lambda _checked=False, mid=monitor.device_id, iid=image.id:
                     self._apply_image_to_monitor(iid, mid)

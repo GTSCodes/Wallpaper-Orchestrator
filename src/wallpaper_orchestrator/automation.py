@@ -51,6 +51,7 @@ class IntervalRule:
 class AutomationConfig:
     background_enabled: bool = False
     rules: tuple[IntervalRule, ...] = ()
+    paused: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,15 +109,18 @@ def load_automation(path: Path | None = None) -> AutomationConfig:
             raise ValueError("Duplicate interval rule ID")
         seen.add(rule.id)
         rules.append(rule)
-    return AutomationConfig(raw["background_enabled"], tuple(rules))
+    paused = raw.get("paused", False)
+    if type(paused) is not bool:
+        raise ValueError("Invalid automation pause setting")
+    return AutomationConfig(raw["background_enabled"], tuple(rules), paused)
 
 
 def save_automation(config: AutomationConfig, path: Path | None = None) -> None:
     path = path or automation_path()
     if path.exists():
         load_automation(path)  # Never replace future/corrupt state.
-    if type(config.background_enabled) is not bool:
-        raise ValueError("Invalid background setting")
+    if type(config.background_enabled) is not bool or type(config.paused) is not bool:
+        raise ValueError("Invalid background or pause setting")
     ids = [rule.id for rule in config.rules]
     if len(ids) != len(set(ids)):
         raise ValueError("Duplicate interval rule IDs")
@@ -126,6 +130,7 @@ def save_automation(config: AutomationConfig, path: Path | None = None) -> None:
         temporary.write_text(json.dumps({
             "version": 1,
             "background_enabled": config.background_enabled,
+            "paused": config.paused,
             "rules": [rule.to_dict() for rule in config.rules],
         }, indent=2), encoding="utf-8")
         temporary.replace(path)
