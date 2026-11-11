@@ -227,12 +227,20 @@ def diagnostic_lines(*, now: float | None = None) -> list[str]:
         f"Saved interval rules: {len(config.rules)}",
     ]
     for rule in config.rules:
-        due = datetime.fromtimestamp(rule.next_due_utc).astimezone()
+        try:
+            due_text = (
+                f"{datetime.fromtimestamp(rule.next_due_utc).astimezone():%Y-%m-%d %H:%M:%S}"
+            )
+        except (OSError, OverflowError, ValueError):
+            due_text = (
+                f"Unix timestamp {rule.next_due_utc} "
+                "(local date unavailable)"
+            )
         remaining = max(0, int(rule.next_due_utc - moment))
         lines.extend([
             f"- Monitors: {', '.join(rule.monitor_ids)}",
             f"  Enabled: {rule.enabled}; interval: {rule.interval_seconds}s",
-            f"  Next due (local): {due:%Y-%m-%d %H:%M:%S} "
+            f"  Next due (local): {due_text} "
             f"({'due now' if remaining == 0 else f'in {remaining}s'})",
             f"  Last result: {rule.last_result}",
         ])
