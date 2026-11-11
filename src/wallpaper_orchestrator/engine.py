@@ -2,6 +2,7 @@
 
 from collections import Counter
 from collections.abc import Collection
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 import random
@@ -9,6 +10,9 @@ import re
 
 from wallpaper_orchestrator.config import load_config
 from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.calendar_rules import (
+    CalendarRule, active_calendar_rule, load_calendar_rules,
+)
 from wallpaper_orchestrator.library import load_wallpapers
 from wallpaper_orchestrator.models import Monitor, Wallpaper
 from wallpaper_orchestrator.selector import choose_for_monitors
@@ -234,11 +238,18 @@ def create_profile_plan(
     selected_device_id: str | None = None,
     selected_device_ids: Collection[str] | None = None,
     respect_theme_limits: bool = True,
+    calendar_rules: list[CalendarRule] | None = None,
+    calendar_now: datetime | None = None,
 ):
     """Plan a shuffle while preserving all monitors that are not targeted.
 
     A fixed monitor is never a shuffle target. Non-target monitors contribute
     their *current* wallpaper tags to theme limits, when metadata is known.
+
+    C4 calendar rules can *filter* an eligible monitor's existing source, but
+    never expand its collection subscriptions or move a file. A preferred
+    filter falls back if no image matches; a required filter explains why
+    the update cannot proceed. A fixed monitor is still never shuffled.
 
     Returned keys are device IDs, so a friendly-name change does not affect
     selections. This is separate from the legacy CLI's role-keyed `create_plan`.
@@ -427,6 +438,65 @@ def create_profile_plan(
             profiles.get(m.device_id, {}),
             m.device_id,
         )
+
+    # Calendar policies are passive selectors. Every existing trigger (the
+    # button, a daily schedule, or the headless interval agent) consults the
+    # current policy; no scheduler needs its own image-selection algorithm.
+    calendar = load_calendar_rules() if calendar_rules is None else calendar_rules
+    moment = calendar_now or datetime.now().astimezone()
+    active_policies = {
+        m.device_id: rule for m in targets
+        if (rule := active_calendar_rule(calendar, moment, m.device_id)) is not None
+    }
+    if active_policies:
+        with WallpaperCatalog() as catalog:
+            images_by_path = {}
+            tag_ids_by_image = {}
+            collection_ids_by_image = {}
+            for monitor in targets:
+                rule = active_policies.get(monitor.device_id)
+                if rule is None:
+                    continue
+                matching = []
+                for wallpaper in candidate_sets[monitor.device_id]:
+                    path_key = _path_key(wallpaper.path)
+                    if path_key not in images_by_path:
+                        images_by_path[path_key] = catalog.find_image_by_path(wallpaper.path)
+                    image = images_by_path[path_key]
+                    # Non-indexed folder images have no database tags or
+                    # collections. A preferred rule will fall back below.
+                    if image is None:
+                        continue
+                    if image.id not in tag_ids_by_image:
+                        tag_ids_by_image[image.id] = {
+                            tag.id for tag in catalog.list_image_tags(image.id)
+                        }
+                    tags = tag_ids_by_image[image.id]
+                    if rule.include_tag_ids and not tags.intersection(rule.include_tag_ids):
+                        continue  # Any listed included tag may match.
+                    if rule.exclude_tag_ids and tags.intersection(rule.exclude_tag_ids):
+                        continue
+                    if rule.collection_ids:
+                        if image.id not in collection_ids_by_image:
+                            collection_ids_by_image[image.id] = {
+                                item.id for item in catalog.list_image_collections(image.id)
+                            }
+                        if not collection_ids_by_image[image.id].intersection(rule.collection_ids):
+                            continue
+                    matching.append(wallpaper)
+                if matching:
+                    source = sources.get(monitor.device_id)
+                    candidate_sets[monitor.device_id] = _order_candidates(
+                        matching, source, profiles.get(monitor.device_id, {}),
+                        monitor.device_id,
+                    )
+                elif rule.behavior == "require":
+                    raise ValueError(
+                        f"Seasonal rule '{rule.name}' has no matching "
+                        f"{monitor.orientation} wallpapers for this display. "
+                        "Add and scan a tagged image in its assigned source, "
+                        "change the rule's filters, or set it to Prefer."
+                    )
 
     # Check more constrained monitors first, then backtrack if needed.
     targets.sort(key=lambda m: len(candidate_sets[m.device_id]))

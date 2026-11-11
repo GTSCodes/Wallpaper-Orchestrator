@@ -14,6 +14,7 @@ from wallpaper_orchestrator.scheduler import (
     ALL_WEEKDAYS, ScheduleRule, due_rules, load_schedules, new_rule,
     record_manual_result, save_schedules, stamp_attempts,
 )
+from wallpaper_orchestrator.calendar_view import CalendarRulesDialog
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -128,9 +129,10 @@ class SchedulesPanel(QWidget):
         title.setObjectName("scheduleTitle")
         layout.addWidget(title)
         subtitle = QLabel(
-            "Advanced calendar rules: rotate eligible wallpapers at chosen "
-            "local times. Fixed-image monitors are never shuffled. "
-            "Enable background mode from Displays → Automate to run when closed."
+            "Create timed wallpaper updates here, or use Seasonal rules… to "
+            "choose images by month, date range, weekday, time and tags. "
+            "Fixed-image monitors are never shuffled. Enable background "
+            "mode from Displays → Automate to continue when closed."
         )
         subtitle.setObjectName("scheduleMuted")
         subtitle.setWordWrap(True)
@@ -141,10 +143,12 @@ class SchedulesPanel(QWidget):
         self.edit_button = QPushButton("Edit")
         self.remove_button = QPushButton("Delete")
         self.run_button = QPushButton("Run now")
+        self.calendar_button = QPushButton("Seasonal rules…")
         actions.addWidget(self.add_button)
         actions.addWidget(self.edit_button)
         actions.addWidget(self.remove_button)
         actions.addStretch(1)
+        actions.addWidget(self.calendar_button)
         actions.addWidget(self.run_button)
         layout.addLayout(actions)
 
@@ -188,6 +192,7 @@ class SchedulesPanel(QWidget):
         self.edit_button.clicked.connect(self._edit)
         self.remove_button.clicked.connect(self._remove)
         self.run_button.clicked.connect(self._run_now)
+        self.calendar_button.clicked.connect(self._open_calendar_rules)
         self.table.itemSelectionChanged.connect(self._buttons)
         self._refresh()
 
@@ -294,6 +299,10 @@ class SchedulesPanel(QWidget):
         chosen = self._selected_rule()
         if chosen is not None:
             self.run_now_requested.emit([chosen])
+
+    def _open_calendar_rules(self):
+        """Keep the Schedules tab compact while exposing advanced filters."""
+        CalendarRulesDialog(self.monitors, self.mapping, self).exec()
 
     def get_due(self, now: datetime) -> list[ScheduleRule]:
         return due_rules(self.rules, now) if self._load_error is None else []
