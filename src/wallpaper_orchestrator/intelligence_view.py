@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.monitor_labels import monitor_labels
 from wallpaper_orchestrator.intelligence import (
     ImageRule, MonitorGroup, SelectionPolicy, SmartCollection,
     load_selection_policy, load_smart_collections,
@@ -130,9 +131,9 @@ class GroupEditor(QDialog):
         form = QFormLayout(contents)
         self.name = QLineEdit(existing.name if existing else "My display group")
         form.addRow("Group name", self.name)
-        labels = {device_id: name for name, device_id in mapping.items()}
+        labels = monitor_labels(monitors, mapping)
         self.monitors = _list(
-            [(labels.get(m.device_id, m.orientation), m.device_id) for m in monitors],
+            [(labels[m.device_id], m.device_id) for m in monitors],
             existing.monitor_ids if existing else (), height=115,
         )
         form.addRow("Displays", self.monitors)
@@ -262,9 +263,18 @@ class IntelligenceDialog(QDialog):
         monitor_page = QWidget()
         monitor_layout = QVBoxLayout(monitor_page)
         self.monitor_choice = QComboBox()
-        labels = {mid: name for name, mid in mapping.items()}
-        for m in monitors:
-            self.monitor_choice.addItem(labels.get(m.device_id, m.orientation), m.device_id)
+        # Display names such as "landscape" are not unique.  Reuse the same
+        # identifiable labels shown in Automation Centre, but store the full
+        # device ID as the combo's user data so saved rules remain stable.
+        labels = monitor_labels(self.monitors, self.mapping)
+        for monitor in self.monitors:
+            label = labels[monitor.device_id]
+            self.monitor_choice.addItem(label, monitor.device_id)
+            self.monitor_choice.setItemData(
+                self.monitor_choice.count() - 1,
+                label,
+                Qt.ItemDataRole.ToolTipRole,
+            )
         monitor_layout.addWidget(self.monitor_choice)
         self.monitor_rule_slot = QVBoxLayout()
         monitor_layout.addLayout(self.monitor_rule_slot)

@@ -90,12 +90,27 @@ def _pythonw_path() -> Path:
     return silent
 
 
+def agent_launch_arguments(
+    *, compiled: bool | None = None, executable: Path | None = None,
+    script: Path | None = None,
+) -> list[str]:
+    """Use this app's executable in compiled builds; Python in source builds.
+
+    Nuitka exposes ``__compiled__`` on compiled modules, not ``sys.frozen``.
+    This helper is independently testable without launching Windows processes.
+    """
+    if compiled is None:
+        compiled = "__compiled__" in globals()
+    if compiled:
+        return [str(executable or Path(sys.executable)), "--background-agent"]
+    return [str(executable or _pythonw_path()),
+            str(script or Path(__file__).resolve())]
+
+
 def startup_command() -> str:
-    """Absolute interpreter and script paths also work outside the repo cwd."""
+    """Register one background worker command for source and standalone builds."""
     _require_windows()
-    command = subprocess.list2cmdline([
-        str(_pythonw_path()), str(Path(__file__).resolve())
-    ])
+    command = subprocess.list2cmdline(agent_launch_arguments())
     if len(command) > 260:
         raise ValueError(
             "The startup path is too long for the Windows Run key. "
@@ -127,10 +142,10 @@ def uninstall_startup() -> None:
 
 
 def start_agent() -> None:
-    """Launch a separate invisible Python process; singleton mutex dedupes."""
+    """Launch a separate invisible worker; singleton mutex dedupes."""
     _require_windows()
     subprocess.Popen(
-        [str(_pythonw_path()), str(Path(__file__).resolve())],
+        agent_launch_arguments(),
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, close_fds=True,
         creationflags=(subprocess.DETACHED_PROCESS |
@@ -322,6 +337,13 @@ def _run_cycle(detector, pending_ids: set[str]) -> str | None:
 def _apply_due_automations() -> str | None:
     """Execute daily, interval and seasonal triggers in one coordinated plan."""
     config = load_automation()
+    # Repair pre-existing overlapping intervals before deciding which are due.
+    # The newest saved enabled timer wins; older overlapping timers are paused.
+    from wallpaper_orchestrator.automation import normalize_interval_conflicts
+    normalized = normalize_interval_conflicts(config)
+    if normalized != config:
+        save_automation(normalized)
+        config = normalized
     if config.paused:
         return "Automations paused by user."
     from PySide6.QtCore import QSettings

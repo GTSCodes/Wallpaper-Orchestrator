@@ -59,13 +59,16 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(config.rules), 1)
         self.assertEqual(config.rules[0].monitor_ids, ("portrait",))
 
-    def test_group_waits_until_every_selected_monitor_is_connected(self):
+    def test_group_continues_for_connected_displays(self):
         config = set_interval(AutomationConfig(), ["p", "l"], 60, now=0)
         targets = resolve_interval_targets(
             list(config.rules), {"p"}, {"p": {"mode": "collections"}}
         )
-        self.assertEqual(targets.device_ids, set())
-        self.assertEqual(targets.deferred_ids, {config.rules[0].id})
+        self.assertEqual(targets.device_ids, {"p"})
+        self.assertEqual(targets.attempted_ids, {config.rules[0].id})
+        self.assertFalse(targets.deferred_ids)
+        returned = resolve_interval_targets(list(config.rules), {"p", "l"}, {})
+        self.assertEqual(returned.device_ids, {"p", "l"})
 
     def test_fixed_member_is_never_shuffled(self):
         config = set_interval(AutomationConfig(), ["p", "l"], 60, now=0)

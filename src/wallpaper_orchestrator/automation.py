@@ -64,17 +64,22 @@ class IntervalTargets:
 def resolve_interval_targets(
     rules: list[IntervalRule], active: set[str], profiles: dict
 ) -> IntervalTargets:
-    """Keep interval groups together; never apply to fixed displays."""
+    """Apply a due interval to connected members, even when others are offline.
+
+    A disconnected member remains saved in its rule and will rejoin at the
+    next interval when Windows reports it as active. Never shuffle fixed ones.
+    """
     devices: set[str] = set()
     attempted: set[str] = set()
     deferred: set[str] = set()
     for rule in rules:
-        if not set(rule.monitor_ids).issubset(active):
+        online = set(rule.monitor_ids) & active
+        if not online:
             deferred.add(rule.id)
             continue
         attempted.add(rule.id)
         devices.update(
-            mid for mid in rule.monitor_ids
+            mid for mid in online
             if profiles.get(mid, {}).get("mode", "folder") != "fixed"
         )
     return IntervalTargets(
@@ -158,7 +163,48 @@ def set_interval(
     )
     updated = [r for r in config.rules if not existing or r.id != existing.id]
     updated.append(rule)
-    return replace(config, rules=tuple(updated))
+    return enforce_interval_exclusivity(replace(config, rules=tuple(updated)), rule.id)
+
+
+
+def overlapping_intervals(config: AutomationConfig, monitor_ids,
+                          *, exclude_id: str | None = None) -> tuple[IntervalRule, ...]:
+    """Return enabled intervals that share one or more stable monitor IDs."""
+    selected = set(monitor_ids)
+    return tuple(rule for rule in config.rules
+                 if rule.enabled and rule.id != exclude_id
+                 and selected.intersection(rule.monitor_ids))
+
+
+def enforce_interval_exclusivity(config: AutomationConfig,
+                                 winning_id: str) -> AutomationConfig:
+    """One enabled interval owner per display; pause, never delete, losers.
+
+    Apply this operation *before* the single atomic save_automation call.
+    Daily/seasonal rules are deliberately separate: a season is a filter,
+    while a daily schedule is an independent trigger managed in Schedules.
+    """
+    winner = next((r for r in config.rules if r.id == winning_id), None)
+    if winner is None:
+        raise ValueError("Unknown interval rule")
+    if not winner.enabled:
+        return config
+    losers = {r.id for r in overlapping_intervals(
+        config, winner.monitor_ids, exclude_id=winner.id)}
+    return replace(config, rules=tuple(
+        replace(r, enabled=False, last_result=(
+            "Paused because another interval uses a shared display"
+        )) if r.id in losers else r for r in config.rules
+    ))
+
+
+def normalize_interval_conflicts(config: AutomationConfig) -> AutomationConfig:
+    """Upgrade pre-C7 overlapping timers deterministically (last enabled wins)."""
+    result = config
+    for rule in reversed(config.rules):
+        if rule.enabled and any(r.id == rule.id and r.enabled for r in result.rules):
+            result = enforce_interval_exclusivity(result, rule.id)
+    return result
 
 
 def remove_interval(config: AutomationConfig, monitor_ids) -> AutomationConfig:

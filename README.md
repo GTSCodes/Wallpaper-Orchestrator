@@ -2,7 +2,15 @@
 
 A Windows-first, open-source wallpaper manager for multi-monitor desktops. It detects active screens (including portrait displays), lets you choose wallpapers for individual monitors, and can select a **coordinated set of wallpapers** that respects theme limits.
 
-> **Project status:** Early development / alpha. The Windows CLI and an initial PySide6 GUI are functional. Several configuration features described under *Roadmap* are not implemented yet.
+> **Project status:** Early development / alpha. C7 includes the Library, intelligent selection, schedules, automation manager and tray companion. C8.1 adds a Windows standalone build workflow; an installer and onboarding are still planned.
+
+## C8.1 standalone Windows build
+
+To create a portable executable that users can run without installing Python,
+see [C8_1_README.md](C8_1_README.md). On Windows, the source build command is
+`./scripts/build_windows.ps1`; alternatively use the **C8 Windows portable
+build** GitHub Actions workflow. The resulting `dist/WallpaperOrchestrator`
+directory must be distributed *in full*, including the runtime dependencies.
 
 ## What works today
 
@@ -29,8 +37,7 @@ Open PowerShell in the repository directory:
 
 ```powershell
 py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m pip install PySide6
+.\.venv\Scripts\python.exe -m pip install -e ".[gui]"
 ```
 
 If you use another compatible Python version, adjust the first command. The `-e .` installation means edits to the source code are used without reinstalling the project each time.

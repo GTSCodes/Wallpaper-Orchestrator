@@ -1,0 +1,483 @@
+diff --git a/src/wallpaper_orchestrator/automation.py b/src/wallpaper_orchestrator/automation.py
+index 2fab4a6..d38abbf 100644
+--- a/src/wallpaper_orchestrator/automation.py
++++ b/src/wallpaper_orchestrator/automation.py
+@@ -64,17 +64,22 @@ class IntervalTargets:
+ def resolve_interval_targets(
+     rules: list[IntervalRule], active: set[str], profiles: dict
+ ) -> IntervalTargets:
+-    """Keep interval groups together; never apply to fixed displays."""
++    """Apply a due interval to connected members, even when others are offline.
++
++    A disconnected member remains saved in its rule and will rejoin at the
++    next interval when Windows reports it as active. Never shuffle fixed ones.
++    """
+     devices: set[str] = set()
+     attempted: set[str] = set()
+     deferred: set[str] = set()
+     for rule in rules:
+-        if not set(rule.monitor_ids).issubset(active):
++        online = set(rule.monitor_ids) & active
++        if not online:
+             deferred.add(rule.id)
+             continue
+         attempted.add(rule.id)
+         devices.update(
+-            mid for mid in rule.monitor_ids
++            mid for mid in online
+             if profiles.get(mid, {}).get("mode", "folder") != "fixed"
+         )
+     return IntervalTargets(
+@@ -158,7 +163,48 @@ def set_interval(
+     )
+     updated = [r for r in config.rules if not existing or r.id != existing.id]
+     updated.append(rule)
+-    return replace(config, rules=tuple(updated))
++    return enforce_interval_exclusivity(replace(config, rules=tuple(updated)), rule.id)
++
++
++
++def overlapping_intervals(config: AutomationConfig, monitor_ids,
++                          *, exclude_id: str | None = None) -> tuple[IntervalRule, ...]:
++    """Return enabled intervals that share one or more stable monitor IDs."""
++    selected = set(monitor_ids)
++    return tuple(rule for rule in config.rules
++                 if rule.enabled and rule.id != exclude_id
++                 and selected.intersection(rule.monitor_ids))
++
++
++def enforce_interval_exclusivity(config: AutomationConfig,
++                                 winning_id: str) -> AutomationConfig:
++    """One enabled interval owner per display; pause, never delete, losers.
++
++    Apply this operation *before* the single atomic save_automation call.
++    Daily/seasonal rules are deliberately separate: a season is a filter,
++    while a daily schedule is an independent trigger managed in Schedules.
++    """
++    winner = next((r for r in config.rules if r.id == winning_id), None)
++    if winner is None:
++        raise ValueError("Unknown interval rule")
++    if not winner.enabled:
++        return config
++    losers = {r.id for r in overlapping_intervals(
++        config, winner.monitor_ids, exclude_id=winner.id)}
++    return replace(config, rules=tuple(
++        replace(r, enabled=False, last_result=(
++            "Paused because another interval uses a shared display"
++        )) if r.id in losers else r for r in config.rules
++    ))
++
++
++def normalize_interval_conflicts(config: AutomationConfig) -> AutomationConfig:
++    """Upgrade pre-C7 overlapping timers deterministically (last enabled wins)."""
++    result = config
++    for rule in reversed(config.rules):
++        if rule.enabled and any(r.id == rule.id and r.enabled for r in result.rules):
++            result = enforce_interval_exclusivity(result, rule.id)
++    return result
+ 
+ 
+ def remove_interval(config: AutomationConfig, monitor_ids) -> AutomationConfig:
+diff --git a/src/wallpaper_orchestrator/automation_manager_view.py b/src/wallpaper_orchestrator/automation_manager_view.py
+index bdf7035..c22b00e 100644
+--- a/src/wallpaper_orchestrator/automation_manager_view.py
++++ b/src/wallpaper_orchestrator/automation_manager_view.py
+@@ -13,13 +13,15 @@ from PySide6.QtWidgets import (
+ )
+ 
+ from wallpaper_orchestrator.automation import (
+-    load_automation, save_automation,
++    enforce_interval_exclusivity, load_automation, normalize_interval_conflicts,
++    overlapping_intervals, save_automation,
+ )
+ from wallpaper_orchestrator.automation_management import find_overlaps, inventory
+ from wallpaper_orchestrator.background import agent_health_text, set_background_enabled
+ from wallpaper_orchestrator.calendar_rules import load_calendar_rules, save_calendar_rules
+ from wallpaper_orchestrator.calendar_view import CalendarRuleEditor
+ from wallpaper_orchestrator.catalog import WallpaperCatalog
++from wallpaper_orchestrator.monitor_labels import monitor_labels
+ from wallpaper_orchestrator.scheduler import load_schedules, save_schedules
+ 
+ 
+@@ -50,10 +52,10 @@ class IntervalEditor(QDialog):
+         form.addRow("Shuffle every", wrap)
+         self.monitors = QListWidget()
+         self.monitors.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+-        roles = {device_id: role for role, device_id in mapping.items()}
++        labels = monitor_labels(monitors, mapping)
+         ids = {monitor.device_id for monitor in monitors} | set(rule.monitor_ids)
+         for mid in sorted(ids):
+-            label = roles.get(mid, mid[:14])
++            label = labels.get(mid, f"Disconnected — {mid[:30]}")
+             item = QListWidgetItem(label)
+             item.setData(USER_ROLE, mid)
+             self.monitors.addItem(item)
+@@ -117,9 +119,9 @@ class AutomationManagerDialog(QDialog):
+         )
+         layout.addWidget(self.pause_all)
+         note = QLabel(
+-            "All interval, daily and seasonal rules appear here. Shared monitors are not "
+-            "automatically conflicts: due events are combined. Warnings identify overlapping "
+-            "intervals or simultaneously active seasonal filters. Pausing never removes a rule."
++            "Only one enabled interval may control each display. Creating, editing or resuming "
++            "a conflicting interval pauses the previous one (without deleting it). "
++            "Daily schedules and seasonal filters are managed separately."
+         )
+         note.setWordWrap(True)
+         note.setStyleSheet("color: #aab8ca")
+@@ -167,8 +169,8 @@ class AutomationManagerDialog(QDialog):
+     def _target_names(self, ids, all_displays=False):
+         if all_displays:
+             return "All eligible displays"
+-        roles = {mid: role for role, mid in self.mapping.items()}
+-        return ", ".join(roles.get(mid, mid[:10]) for mid in sorted(ids))
++        labels = monitor_labels(self.monitors, self.mapping)
++        return ", ".join(labels.get(mid, f"Disconnected ({mid[:14]})") for mid in sorted(ids))
+ 
+     def _selected(self):
+         row = self.table.currentRow()
+@@ -186,6 +188,10 @@ class AutomationManagerDialog(QDialog):
+         previous = self._selected()
+         try:
+             self.config = load_automation()
++            exclusive = normalize_interval_conflicts(self.config)
++            if exclusive != self.config:
++                save_automation(exclusive)
++                self.config = exclusive
+             self.intervals = list(self.config.rules)
+             self.daily = load_schedules()
+             self.seasons = load_calendar_rules()
+@@ -243,8 +249,8 @@ class AutomationManagerDialog(QDialog):
+         self.table.blockSignals(False)
+         self.message.setText(
+             f"{len(entries)} saved automation(s); "
+-            f"{sum(o.severity == 'warning' for o in self.overlaps)} overlaps to review. "
+-            "Editing a rule preserves the others."
++            f"{sum(o.severity == 'warning' for o in self.overlaps)} overlap warning(s). "
++            "Conflicting intervals pause automatically; no rules are deleted."
+         )
+         self._buttons()
+ 
+@@ -270,13 +276,49 @@ class AutomationManagerDialog(QDialog):
+ 
+     def _change(self, kind, rule_id, replacement=None, *, remove=False):
+         sources = {"Interval": self.intervals, "Daily": self.daily, "Seasonal": self.seasons}
+-        updated = ([r for r in sources[kind] if r.id != rule_id] if remove
+-                   else [replacement if r.id == rule_id else r for r in sources[kind]])
+-        try:
+-            self._save_rules(kind, updated)
+-        except (OSError, ValueError) as error:
+-            QMessageBox.critical(self, "Automation save failed", str(error))
+-            return False
++        if kind == "Interval":
++            # Refresh at save time: the agent may have advanced a due timer while
++            # this dialog was open. Keep the interval change in ONE atomic file.
++            try:
++                current = load_automation()
++                previous = next((r for r in current.rules if r.id == rule_id), None)
++                if previous is None:
++                    raise ValueError("This interval no longer exists. Refresh the list.")
++                conflicting = (overlapping_intervals(
++                    current, replacement.monitor_ids, exclude_id=rule_id
++                ) if not remove and replacement.enabled else ())
++                if conflicting and not previous.enabled:
++                    names = "\n".join(
++                        f"• {self._target_names(r.monitor_ids)}" for r in conflicting
++                    )
++                    decision = QMessageBox.question(
++                        self, "Conflicting automation",
++                        f"Resuming this automation will pause {len(conflicting)} other "
++                        f"enabled interval(s) using the same display(s):\n{names}\n\n"
++                        "Continue? Paused rules remain saved.",
++                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++                        QMessageBox.StandardButton.No,
++                    )
++                    if decision != QMessageBox.StandardButton.Yes:
++                        return False
++                updated = [r for r in current.rules if r.id != rule_id] if remove else [
++                    replacement if r.id == rule_id else r for r in current.rules
++                ]
++                config = replace(current, rules=tuple(updated))
++                if not remove and replacement.enabled:
++                    config = enforce_interval_exclusivity(config, rule_id)
++                save_automation(config)
++            except (OSError, ValueError) as error:
++                QMessageBox.critical(self, "Automation save failed", str(error))
++                return False
++        else:
++            updated = ([r for r in sources[kind] if r.id != rule_id] if remove
++                       else [replacement if r.id == rule_id else r for r in sources[kind]])
++            try:
++                self._save_rules(kind, updated)
++            except (OSError, ValueError) as error:
++                QMessageBox.critical(self, "Automation save failed", str(error))
++                return False
+         self.refresh()
+         return True
+ 
+diff --git a/src/wallpaper_orchestrator/background.py b/src/wallpaper_orchestrator/background.py
+index 93109f5..fc8ef0e 100644
+--- a/src/wallpaper_orchestrator/background.py
++++ b/src/wallpaper_orchestrator/background.py
+@@ -322,6 +322,13 @@ def _run_cycle(detector, pending_ids: set[str]) -> str | None:
+ def _apply_due_automations() -> str | None:
+     """Execute daily, interval and seasonal triggers in one coordinated plan."""
+     config = load_automation()
++    # Repair pre-existing overlapping intervals before deciding which are due.
++    # The newest saved enabled timer wins; older overlapping timers are paused.
++    from wallpaper_orchestrator.automation import normalize_interval_conflicts
++    normalized = normalize_interval_conflicts(config)
++    if normalized != config:
++        save_automation(normalized)
++        config = normalized
+     if config.paused:
+         return "Automations paused by user."
+     from PySide6.QtCore import QSettings
+diff --git a/src/wallpaper_orchestrator/gui.py b/src/wallpaper_orchestrator/gui.py
+index e8868fc..bec64a0 100644
+--- a/src/wallpaper_orchestrator/gui.py
++++ b/src/wallpaper_orchestrator/gui.py
+@@ -39,7 +39,8 @@ from PySide6.QtWidgets import (
+ 
+ from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
+ from wallpaper_orchestrator.automation import (
+-    load_automation, matching_rule, remove_interval, save_automation, set_interval,
++    load_automation, matching_rule, overlapping_intervals, remove_interval,
++    save_automation, set_interval,
+ )
+ from wallpaper_orchestrator.automation_view import AutomateDialog
+ from wallpaper_orchestrator.background import (
+@@ -996,6 +997,8 @@ class WallpaperWindow(QMainWindow):
+         except (OSError, ValueError) as error:
+             QMessageBox.critical(self, "Automation Error", str(error))
+             return
++        conflicting = (overlapping_intervals(original, ids)
++                       if dialog.action == "save" else ())
+         try:
+             updated = (
+                 remove_interval(original, ids) if dialog.action == "remove"
+@@ -1032,6 +1035,8 @@ class WallpaperWindow(QMainWindow):
+             self.status.setText(
+                 f"Automating {display_count_text(len(ids))} every "
+                 f"{dialog.number.value()} {dialog.unit.currentText().lower()}."
++                + (f" Paused {len(conflicting)} overlapping interval(s)."
++                   if conflicting else "")
+             )
+             if dialog.run_now.isChecked():
+                 self.change_selection()
+diff --git a/src/wallpaper_orchestrator/intelligence_view.py b/src/wallpaper_orchestrator/intelligence_view.py
+index d8e0fae..a64ea7c 100644
+--- a/src/wallpaper_orchestrator/intelligence_view.py
++++ b/src/wallpaper_orchestrator/intelligence_view.py
+@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
+ )
+ 
+ from wallpaper_orchestrator.catalog import WallpaperCatalog
++from wallpaper_orchestrator.monitor_labels import monitor_labels
+ from wallpaper_orchestrator.intelligence import (
+     ImageRule, MonitorGroup, SelectionPolicy, SmartCollection,
+     load_selection_policy, load_smart_collections,
+@@ -130,9 +131,9 @@ class GroupEditor(QDialog):
+         form = QFormLayout(contents)
+         self.name = QLineEdit(existing.name if existing else "My display group")
+         form.addRow("Group name", self.name)
+-        labels = {device_id: name for name, device_id in mapping.items()}
++        labels = monitor_labels(monitors, mapping)
+         self.monitors = _list(
+-            [(labels.get(m.device_id, m.orientation), m.device_id) for m in monitors],
++            [(labels[m.device_id], m.device_id) for m in monitors],
+             existing.monitor_ids if existing else (), height=115,
+         )
+         form.addRow("Displays", self.monitors)
+diff --git a/src/wallpaper_orchestrator/monitor_labels.py b/src/wallpaper_orchestrator/monitor_labels.py
+new file mode 100644
+index 0000000..0eeb095
+--- /dev/null
++++ b/src/wallpaper_orchestrator/monitor_labels.py
+@@ -0,0 +1,26 @@
++"""Human-friendly *unique* labels while retaining persistent Windows IDs as keys."""
++
++from hashlib import sha1
++
++
++def monitor_labels(monitors, mapping: dict[str, str]) -> dict[str, str]:
++    """Return stable distinguishable labels even for two same-sized landscapes.
++
++    A role in mapping (e.g. 'landscape') need not be unique. The model/UID
++    in Windows' monitor device path and an ID fingerprint disambiguate it.
++    Labels are presentation only; saved rules continue to use device_id.
++    """
++    roles = {mid: role for role, mid in mapping.items()}
++    labels = {}
++    for monitor in monitors:
++        mid = monitor.device_id
++        role = roles.get(mid) or getattr(monitor, "orientation", "display")
++        dimensions = f"{monitor.width}×{monitor.height}"
++        pieces = mid.split("#")
++        model = pieces[1] if len(pieces) > 1 else ""
++        identity = pieces[2].split("&")[-1] if len(pieces) > 2 else ""
++        marker = " / ".join(value for value in (model, identity) if value)
++        marker = marker[:28] if marker else "ID"
++        unique = sha1(mid.encode("utf-8")).hexdigest()[:6]
++        labels[mid] = f"{role} — {dimensions} — {marker} [{unique}]"
++    return labels
+diff --git a/tests/test_automation.py b/tests/test_automation.py
+index 9d1e199..91ecd7d 100644
+--- a/tests/test_automation.py
++++ b/tests/test_automation.py
+@@ -59,13 +59,16 @@ class AutomationTests(unittest.TestCase):
+         self.assertEqual(len(config.rules), 1)
+         self.assertEqual(config.rules[0].monitor_ids, ("portrait",))
+ 
+-    def test_group_waits_until_every_selected_monitor_is_connected(self):
++    def test_group_continues_for_connected_displays(self):
+         config = set_interval(AutomationConfig(), ["p", "l"], 60, now=0)
+         targets = resolve_interval_targets(
+             list(config.rules), {"p"}, {"p": {"mode": "collections"}}
+         )
+-        self.assertEqual(targets.device_ids, set())
+-        self.assertEqual(targets.deferred_ids, {config.rules[0].id})
++        self.assertEqual(targets.device_ids, {"p"})
++        self.assertEqual(targets.attempted_ids, {config.rules[0].id})
++        self.assertFalse(targets.deferred_ids)
++        returned = resolve_interval_targets(list(config.rules), {"p", "l"}, {})
++        self.assertEqual(returned.device_ids, {"p", "l"})
+ 
+     def test_fixed_member_is_never_shuffled(self):
+         config = set_interval(AutomationConfig(), ["p", "l"], 60, now=0)
+diff --git a/tests/test_c7_monitor_fixes.py b/tests/test_c7_monitor_fixes.py
+new file mode 100644
+index 0000000..a43b77c
+--- /dev/null
++++ b/tests/test_c7_monitor_fixes.py
+@@ -0,0 +1,130 @@
++"""Headless C7/C8.1 regressions for monitor-aware interval automation."""
++
++import tempfile
++import unittest
++import sys
++import types
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from wallpaper_orchestrator.automation import (
++    AutomationConfig, IntervalRule, enforce_interval_exclusivity,
++    normalize_interval_conflicts, overlapping_intervals,
++    load_automation, resolve_interval_targets, save_automation, set_interval,
++)
++from wallpaper_orchestrator.monitor_labels import monitor_labels
++
++
++class MonitorFixes(unittest.TestCase):
++    def test_laptop_lid_disconnection_does_not_block_external_monitors(self):
++        config = set_interval(AutomationConfig(), ["laptop", "left", "right"], 60, now=5)
++        result = resolve_interval_targets(list(config.rules), {"left", "right"}, {})
++        self.assertEqual(result.device_ids, {"left", "right"})
++        self.assertEqual(result.attempted_ids, {config.rules[0].id})
++        self.assertFalse(result.deferred_ids)
++        reconnected = resolve_interval_targets(list(config.rules), {"laptop", "left", "right"}, {})
++        self.assertEqual(reconnected.device_ids, {"laptop", "left", "right"})
++
++    def test_wholly_disconnected_interval_is_deferred_without_stamping(self):
++        config = set_interval(AutomationConfig(), ["laptop"], 60, now=5)
++        result = resolve_interval_targets(list(config.rules), {"left", "right"}, {})
++        self.assertFalse(result.device_ids)
++        self.assertFalse(result.attempted_ids)
++        self.assertEqual(result.deferred_ids, {config.rules[0].id})
++
++    def test_one_fixed_monitor_never_blocks_other_members(self):
++        config = set_interval(AutomationConfig(), ["laptop", "left", "right"], 60, now=5)
++        targets = resolve_interval_targets(list(config.rules), {"left", "right"},
++                                           {"left": {"mode": "fixed"}})
++        self.assertEqual(targets.device_ids, {"right"})
++
++    def test_adding_overlapping_group_pauses_older_without_deleting(self):
++        original = set_interval(AutomationConfig(), ["portrait"], 60, now=5)
++        first_id = original.rules[0].id
++        updated = set_interval(original, ["portrait", "landscape"], 120, now=9)
++        self.assertEqual(len(updated.rules), 2)
++        self.assertFalse(next(r for r in updated.rules if r.id == first_id).enabled)
++        self.assertTrue(next(r for r in updated.rules if r.id != first_id).enabled)
++        self.assertEqual(len(overlapping_intervals(updated, ["portrait"])), 1)
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "automation.json"
++            save_automation(updated, path)
++            self.assertEqual(load_automation(path), updated)
++
++    def test_nonoverlapping_groups_can_run_together(self):
++        updated = set_interval(AutomationConfig(), ["portrait"], 60, now=5)
++        updated = set_interval(updated, ["landscape"], 120, now=9)
++        self.assertEqual(sum(r.enabled for r in updated.rules), 2)
++
++    def test_resuming_old_interval_pauses_newer_conflict(self):
++        config = set_interval(AutomationConfig(), ["portrait"], 60, now=0)
++        config = set_interval(config, ["portrait", "landscape"], 120, now=0)
++        old = config.rules[0]
++        updated = replace(config, rules=(replace(old, enabled=True), config.rules[1]))
++        updated = enforce_interval_exclusivity(updated, old.id)
++        self.assertTrue(updated.rules[0].enabled)
++        self.assertFalse(updated.rules[1].enabled)
++
++    def test_legacy_overlaps_normalize_deterministically_without_removing(self):
++        previous = AutomationConfig(rules=(
++            IntervalRule("old", ("p",), 60, 60),
++            IntervalRule("new", ("p", "l"), 120, 120),
++        ))
++        updated = normalize_interval_conflicts(previous)
++        self.assertFalse(updated.rules[0].enabled)
++        self.assertTrue(updated.rules[1].enabled)
++        self.assertEqual(normalize_interval_conflicts(updated), updated)
++
++    def test_agent_updates_two_connected_displays_when_third_is_offline(self):
++        """Integration test: physical target set passed to the selection engine."""
++        from wallpaper_orchestrator import background, engine
++        config = set_interval(
++            AutomationConfig(background_enabled=True),
++            ["laptop", "left", "right"], 60, now=0,
++        )
++        qt = types.ModuleType("PySide6")
++        qtcore = types.ModuleType("PySide6.QtCore")
++        qtcore.QSettings = lambda *_a: SimpleNamespace(
++            value=lambda _key, default, **_kw: default
++        )
++        with patch.dict(sys.modules, {"PySide6": qt, "PySide6.QtCore": qtcore}), \
++             patch.object(background, "load_automation", return_value=config), \
++             patch.object(background, "save_automation"), \
++             patch.object(background, "load_schedules", return_value=[]), \
++             patch.object(background, "load_calendar_rules", return_value=[]), \
++             patch.object(background, "load_seasonal_state", return_value={}), \
++             patch.object(background, "load_profiles", return_value={}), \
++             patch.object(background, "save_profiles"), \
++             patch("wallpaper_orchestrator.platforms.windows.discover_monitors",
++                   return_value=[SimpleNamespace(device_id="left"),
++                                 SimpleNamespace(device_id="right")]), \
++             patch.object(engine, "create_profile_plan", return_value=(
++                 {"left": SimpleNamespace(path=Path("one.jpg")),
++                  "right": SimpleNamespace(path=Path("two.jpg"))},
++                 {"left": "left", "right": "right"})) as planner, \
++             patch.object(engine, "apply_plan") as apply:
++            result = background._apply_due_automations()
++        self.assertIn("Applied 2 wallpaper", result)
++        self.assertEqual(planner.call_args.kwargs["selected_device_ids"],
++                         {"left", "right"})
++        apply.assert_called_once()
++
++    def test_labels_show_two_different_landscapes_with_stable_ids(self):
++        monitors = [
++            SimpleNamespace(device_id=r"\\?\DISPLAY#AAA#X&UID1#{guid}", width=1920, height=1080,
++                            orientation="landscape"),
++            SimpleNamespace(device_id=r"\\?\DISPLAY#BBB#X&UID2#{guid}", width=1920, height=1080,
++                            orientation="landscape"),
++        ]
++        result = monitor_labels(monitors, {"landscape": monitors[0].device_id})
++        self.assertEqual(len(set(result.values())), 2)
++        self.assertIn("1920×1080", result[monitors[1].device_id])
++        self.assertIn("BBB", result[monitors[1].device_id])
++        self.assertEqual(result, monitor_labels(list(reversed(monitors)),
++                                                {"landscape": monitors[0].device_id}))
++
++
++if __name__ == "__main__":
++    unittest.main()

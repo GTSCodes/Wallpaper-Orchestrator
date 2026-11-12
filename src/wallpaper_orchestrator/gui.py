@@ -39,7 +39,8 @@ from PySide6.QtWidgets import (
 
 from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
 from wallpaper_orchestrator.automation import (
-    load_automation, matching_rule, remove_interval, save_automation, set_interval,
+    load_automation, matching_rule, overlapping_intervals, remove_interval,
+    save_automation, set_interval,
 )
 from wallpaper_orchestrator.automation_view import AutomateDialog
 from wallpaper_orchestrator.background import (
@@ -996,6 +997,8 @@ class WallpaperWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Automation Error", str(error))
             return
+        conflicting = (overlapping_intervals(original, ids)
+                       if dialog.action == "save" else ())
         try:
             updated = (
                 remove_interval(original, ids) if dialog.action == "remove"
@@ -1032,6 +1035,8 @@ class WallpaperWindow(QMainWindow):
             self.status.setText(
                 f"Automating {display_count_text(len(ids))} every "
                 f"{dialog.number.value()} {dialog.unit.currentText().lower()}."
+                + (f" Paused {len(conflicting)} overlapping interval(s)."
+                   if conflicting else "")
             )
             if dialog.run_now.isChecked():
                 self.change_selection()

@@ -1,28 +1,10 @@
-
-# Python virtual environment
 .venv/
-
-# Python-generated files
 __pycache__/
 *.py[cod]
-
-# Testing and formatting caches
+*.egg-info/
 .pytest_cache/
-.ruff_cache/
-.coverage
-
-# Packaging output
+.nuitka/
 build/
 dist/
-*.egg-info/
-
-# Operating-system files
-.DS_Store
-Thumbs.db
-
-# Personal wallpaper collections and configuration
-/wallpapers/
-/Wallpapers/
-/user-data/
-*.local.json
-*.local.toml
+assets/*.ico
+pysidedeploy.spec

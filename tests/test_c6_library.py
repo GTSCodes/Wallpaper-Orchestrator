@@ -1,5 +1,6 @@
 """C6 data safety: schema migration, bulk tags and folder defaults."""
 
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -35,9 +36,12 @@ class LibraryC6Tests(unittest.TestCase):
         path = self.catalog.path
         self.catalog.close()
         # Emulate the exact prior-version schema in an isolated copy.
-        with sqlite3.connect(path) as db:
-            db.execute("DROP TABLE folder_tag_defaults")
-            db.execute("PRAGMA user_version = 1")
+        # Connection.__exit__ commits or rolls back, but does not close the
+        # SQLite handle. Windows cannot remove the temp database until closed.
+        with closing(sqlite3.connect(path)) as db:
+            with db:
+                db.execute("DROP TABLE folder_tag_defaults")
+                db.execute("PRAGMA user_version = 1")
         with WallpaperCatalog(path) as upgraded:
             self.assertIn(collection, upgraded.list_collections())
             self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 2)

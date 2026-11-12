@@ -13,13 +13,15 @@ from PySide6.QtWidgets import (
 )
 
 from wallpaper_orchestrator.automation import (
-    load_automation, save_automation,
+    enforce_interval_exclusivity, load_automation, normalize_interval_conflicts,
+    overlapping_intervals, save_automation,
 )
 from wallpaper_orchestrator.automation_management import find_overlaps, inventory
 from wallpaper_orchestrator.background import agent_health_text, set_background_enabled
 from wallpaper_orchestrator.calendar_rules import load_calendar_rules, save_calendar_rules
 from wallpaper_orchestrator.calendar_view import CalendarRuleEditor
 from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.monitor_labels import monitor_labels
 from wallpaper_orchestrator.scheduler import load_schedules, save_schedules
 
 
@@ -50,10 +52,10 @@ class IntervalEditor(QDialog):
         form.addRow("Shuffle every", wrap)
         self.monitors = QListWidget()
         self.monitors.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        roles = {device_id: role for role, device_id in mapping.items()}
+        labels = monitor_labels(monitors, mapping)
         ids = {monitor.device_id for monitor in monitors} | set(rule.monitor_ids)
         for mid in sorted(ids):
-            label = roles.get(mid, mid[:14])
+            label = labels.get(mid, f"Disconnected — {mid[:30]}")
             item = QListWidgetItem(label)
             item.setData(USER_ROLE, mid)
             self.monitors.addItem(item)
@@ -117,9 +119,9 @@ class AutomationManagerDialog(QDialog):
         )
         layout.addWidget(self.pause_all)
         note = QLabel(
-            "All interval, daily and seasonal rules appear here. Shared monitors are not "
-            "automatically conflicts: due events are combined. Warnings identify overlapping "
-            "intervals or simultaneously active seasonal filters. Pausing never removes a rule."
+            "Only one enabled interval may control each display. Creating, editing or resuming "
+            "a conflicting interval pauses the previous one (without deleting it). "
+            "Daily schedules and seasonal filters are managed separately."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #aab8ca")
@@ -167,8 +169,8 @@ class AutomationManagerDialog(QDialog):
     def _target_names(self, ids, all_displays=False):
         if all_displays:
             return "All eligible displays"
-        roles = {mid: role for role, mid in self.mapping.items()}
-        return ", ".join(roles.get(mid, mid[:10]) for mid in sorted(ids))
+        labels = monitor_labels(self.monitors, self.mapping)
+        return ", ".join(labels.get(mid, f"Disconnected ({mid[:14]})") for mid in sorted(ids))
 
     def _selected(self):
         row = self.table.currentRow()
@@ -186,6 +188,10 @@ class AutomationManagerDialog(QDialog):
         previous = self._selected()
         try:
             self.config = load_automation()
+            exclusive = normalize_interval_conflicts(self.config)
+            if exclusive != self.config:
+                save_automation(exclusive)
+                self.config = exclusive
             self.intervals = list(self.config.rules)
             self.daily = load_schedules()
             self.seasons = load_calendar_rules()
@@ -243,8 +249,8 @@ class AutomationManagerDialog(QDialog):
         self.table.blockSignals(False)
         self.message.setText(
             f"{len(entries)} saved automation(s); "
-            f"{sum(o.severity == 'warning' for o in self.overlaps)} overlaps to review. "
-            "Editing a rule preserves the others."
+            f"{sum(o.severity == 'warning' for o in self.overlaps)} overlap warning(s). "
+            "Conflicting intervals pause automatically; no rules are deleted."
         )
         self._buttons()
 
@@ -270,13 +276,49 @@ class AutomationManagerDialog(QDialog):
 
     def _change(self, kind, rule_id, replacement=None, *, remove=False):
         sources = {"Interval": self.intervals, "Daily": self.daily, "Seasonal": self.seasons}
-        updated = ([r for r in sources[kind] if r.id != rule_id] if remove
-                   else [replacement if r.id == rule_id else r for r in sources[kind]])
-        try:
-            self._save_rules(kind, updated)
-        except (OSError, ValueError) as error:
-            QMessageBox.critical(self, "Automation save failed", str(error))
-            return False
+        if kind == "Interval":
+            # Refresh at save time: the agent may have advanced a due timer while
+            # this dialog was open. Keep the interval change in ONE atomic file.
+            try:
+                current = load_automation()
+                previous = next((r for r in current.rules if r.id == rule_id), None)
+                if previous is None:
+                    raise ValueError("This interval no longer exists. Refresh the list.")
+                conflicting = (overlapping_intervals(
+                    current, replacement.monitor_ids, exclude_id=rule_id
+                ) if not remove and replacement.enabled else ())
+                if conflicting and not previous.enabled:
+                    names = "\n".join(
+                        f"• {self._target_names(r.monitor_ids)}" for r in conflicting
+                    )
+                    decision = QMessageBox.question(
+                        self, "Conflicting automation",
+                        f"Resuming this automation will pause {len(conflicting)} other "
+                        f"enabled interval(s) using the same display(s):\n{names}\n\n"
+                        "Continue? Paused rules remain saved.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if decision != QMessageBox.StandardButton.Yes:
+                        return False
+                updated = [r for r in current.rules if r.id != rule_id] if remove else [
+                    replacement if r.id == rule_id else r for r in current.rules
+                ]
+                config = replace(current, rules=tuple(updated))
+                if not remove and replacement.enabled:
+                    config = enforce_interval_exclusivity(config, rule_id)
+                save_automation(config)
+            except (OSError, ValueError) as error:
+                QMessageBox.critical(self, "Automation save failed", str(error))
+                return False
+        else:
+            updated = ([r for r in sources[kind] if r.id != rule_id] if remove
+                       else [replacement if r.id == rule_id else r for r in sources[kind]])
+            try:
+                self._save_rules(kind, updated)
+            except (OSError, ValueError) as error:
+                QMessageBox.critical(self, "Automation save failed", str(error))
+                return False
         self.refresh()
         return True
 
