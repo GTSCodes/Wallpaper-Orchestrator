@@ -437,6 +437,10 @@ class WallpaperWindow(QMainWindow):
         self._tray_controller = None
         self._tray_exit_requested = False
 
+        # Reopenable guided setup; avoid reorganising the existing advanced UI.
+        setup_menu = self.menuBar().addMenu("Setup")
+        setup_menu.addAction("Run setup wizard…", self.run_setup_wizard)
+
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
         self.setCentralWidget(self.tabs)
@@ -696,6 +700,16 @@ class WallpaperWindow(QMainWindow):
             self.monitor_items[self.monitors[0].device_id].setSelected(True)
         else:
             self.monitor_selected()
+        QTimer.singleShot(0, self._maybe_first_run_setup)
+
+    def _maybe_first_run_setup(self):
+        from wallpaper_orchestrator.onboarding_state import should_offer_setup
+        if should_offer_setup(self.settings):
+            self.run_setup_wizard()
+
+    def run_setup_wizard(self):
+        from wallpaper_orchestrator.setup_wizard import FirstRunWizard
+        FirstRunWizard(self).exec()
 
     def _watch_screen(self, screen):
         """Watch movement, resizing and rotation of an existing Qt screen."""

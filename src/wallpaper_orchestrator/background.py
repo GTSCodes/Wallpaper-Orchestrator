@@ -46,12 +46,14 @@ from dataclasses import replace
 from datetime import datetime
 import json
 import os
+import traceback
 from pathlib import Path
 import subprocess
 import sys
 import time
 from uuid import uuid4
 
+from wallpaper_orchestrator.bundle_identity import IS_STANDALONE_BUNDLE
 from wallpaper_orchestrator.automation import (
     advance_intervals, automation_path, due_intervals, load_automation,
     record_interval_results, resolve_interval_targets, save_automation,
@@ -72,6 +74,7 @@ from wallpaper_orchestrator.watcher import FolderChangeDetector
 STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_NAME = "WallpaperOrchestratorAgent"
 MUTEX_NAME = r"Local\WallpaperOrchestratorAutomationAgent"
+STOP_EVENT_NAME = r"Local\WallpaperOrchestratorAgentStop"
 
 
 def _require_windows():
@@ -90,19 +93,54 @@ def _pythonw_path() -> Path:
     return silent
 
 
+def _native_process_executable() -> Path:
+    """Return the image Windows actually started, not Python's sys.executable.
+
+    Some frozen/Nuitka runtimes leave sys.executable pointing at a synthetic
+    python.exe inside the standalone folder. GetModuleFileNameW(NULL) obtains
+    the path of *this process's* executable directly from Windows instead.
+    """
+    if sys.platform != "win32":
+        # Allows deterministic tests and non-Windows source development.
+        return Path(sys.executable)
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_name = kernel.GetModuleFileNameW
+    get_name.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint]
+    get_name.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_name(None, buffer, len(buffer))
+    if not length:
+        raise OSError(ctypes.get_last_error(),
+                      "Windows could not determine the running executable")
+    if length >= len(buffer):
+        raise RuntimeError("The running executable path exceeds the Windows limit")
+    return Path(buffer.value)
+
+
 def agent_launch_arguments(
     *, compiled: bool | None = None, executable: Path | None = None,
     script: Path | None = None,
 ) -> list[str]:
     """Use this app's executable in compiled builds; Python in source builds.
 
-    Nuitka exposes ``__compiled__`` on compiled modules, not ``sys.frozen``.
-    This helper is independently testable without launching Windows processes.
+    The build script embeds a deterministic bundle marker. Nuitka's
+    ``__compiled__``, frozen flag and executable name are compatibility
+    fallbacks, not the primary means of detecting a packaged application.
     """
     if compiled is None:
-        compiled = "__compiled__" in globals()
+        compiled = (
+            IS_STANDALONE_BUNDLE
+            or "__compiled__" in globals()
+            or bool(getattr(sys, "frozen", False))
+            or _native_process_executable().name.casefold()
+            == "wallpaperorchestrator.exe"
+        )
     if compiled:
-        return [str(executable or Path(sys.executable)), "--background-agent"]
+        # In a Nuitka standalone process sys.executable may be a nonexistent
+        # python.exe, so query the actual Windows module instead.
+        target = executable if executable is not None else _native_process_executable()
+        return [str(target), "--background-agent"]
     return [str(executable or _pythonw_path()),
             str(script or Path(__file__).resolve())]
 
@@ -141,16 +179,108 @@ def uninstall_startup() -> None:
         pass
 
 
+def _launch_log_path() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
+    return root / "WallpaperOrchestrator" / "background-launch.log"
+
+
+def _record_launch_attempt(command: list[str], *, result: str,
+                           error: BaseException | None = None) -> None:
+    """Explain hidden-process failures without including wallpaper image paths.
+
+    A windowed Nuitka executable has no useful stderr, so this small file is
+    intentionally readable outside the application. It contains the launcher
+    and working directory, but never scans the user's wallpaper library.
+    """
+    try:
+        log = _launch_log_path()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        details = [
+            f"UTC: {datetime.now().astimezone().isoformat()}",
+            f"Result: {result}",
+            f"Standalone marker: {IS_STANDALONE_BUNDLE}",
+            f"Nuitka compiled flag: {'__compiled__' in globals()}",
+            f"Python sys.executable: {sys.executable}",
+            f"Windows process executable: {_native_process_executable()}",
+            f"Launcher exists: {Path(command[0]).is_file()}",
+            f"Command: {subprocess.list2cmdline(command)}",
+            f"Working directory: {os.getcwd()}",
+        ]
+        if error is not None:
+            details.extend((f"Error: {error}", "Traceback:",
+                            "".join(traceback.format_exception(error))))
+        # The most recent launch result is enough; avoid unbounded logs.
+        log.write_text("\n".join(details)[-12000:] + "\n", encoding="utf-8")
+    except Exception:
+        pass  # Diagnostics must never mask the actual launch exception.
+
+
 def start_agent() -> None:
-    """Launch a separate invisible worker; singleton mutex dedupes."""
+    """Launch a separate invisible worker; its Windows mutex deduplicates."""
     _require_windows()
-    subprocess.Popen(
-        agent_launch_arguments(),
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, close_fds=True,
-        creationflags=(subprocess.DETACHED_PROCESS |
-                       subprocess.CREATE_NEW_PROCESS_GROUP),
-    )
+    command = agent_launch_arguments()
+    if not Path(command[0]).is_file():
+        error = FileNotFoundError(
+            f"The background launcher does not exist: {command[0]}. "
+            "Check that the correct executable was packaged and launched."
+        )
+        _record_launch_attempt(command, result="missing executable", error=error)
+        raise error
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+            cwd=str(Path(command[0]).resolve().parent),
+            creationflags=(subprocess.DETACHED_PROCESS |
+                           subprocess.CREATE_NEW_PROCESS_GROUP),
+        )
+    except OSError as error:
+        _record_launch_attempt(command, result="process creation failed", error=error)
+        raise RuntimeError(
+            f"Cannot launch background agent: {error}. "
+            f"See {_launch_log_path()} for the command and traceback."
+        ) from error
+    _record_launch_attempt(command, result=f"created child PID {child.pid}")
+
+
+def _stop_event():
+    """Create one named event used solely to stop an agent during updates."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool,
+                                    ctypes.c_bool, ctypes.c_wchar_p]
+    kernel.CreateEventW.restype = ctypes.c_void_p
+    handle = kernel.CreateEventW(None, True, False, STOP_EVENT_NAME)
+    if not handle:
+        raise OSError("Cannot create background-agent stop event")
+    kernel.ResetEvent(ctypes.c_void_p(handle))
+    return handle
+
+
+def stop_agent(*, timeout: float = 15) -> bool:
+    """Ask the agent to exit without changing saved automation preferences.
+
+    Called by the installer before replacing files; there is no third-party
+    process killer, background Windows service or modification to user data.
+    """
+    _require_windows()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel.OpenEventW.restype = ctypes.c_void_p
+    handle = kernel.OpenEventW(0x0002, False, STOP_EVENT_NAME)  # EVENT_MODIFY_STATE
+    if not handle:
+        return True  # No stop event means no agent has published one.
+    try:
+        if not kernel.SetEvent(ctypes.c_void_p(handle)):
+            raise OSError("Cannot signal background agent to stop")
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if not agent_alive():
+                return True
+            time.sleep(0.2)
+        return not agent_alive()
+    finally:
+        kernel.CloseHandle(ctypes.c_void_p(handle))
 
 
 def set_background_enabled(enabled: bool) -> None:
@@ -436,6 +566,7 @@ def main() -> int:
     handle = _single_instance_mutex()
     if handle is None:
         return 0
+    stop_event = _stop_event()
     ole = ctypes.windll.ole32
     initialized = ole.CoInitialize(None) in (0, 1)
     detector = FolderChangeDetector()
@@ -445,6 +576,10 @@ def main() -> int:
         if not initialized:
             raise RuntimeError("Cannot initialize Windows COM for wallpapers")
         while load_automation().background_enabled:
+            if ctypes.windll.kernel32.WaitForSingleObject(
+                    ctypes.c_void_p(stop_event), 0) == 0:
+                last_message = "Background agent stopped for installation or update."
+                break
             try:
                 update = _run_cycle(detector, pending_ids)
                 if update:
@@ -452,7 +587,9 @@ def main() -> int:
             except Exception as error:
                 last_message = f"Background agent will retry: {error}"
             _write_status(last_message)
-            time.sleep(10)
+            if ctypes.windll.kernel32.WaitForSingleObject(
+                    ctypes.c_void_p(stop_event), 10000) == 0:
+                break
         _write_status("Background automation stopped.", running=False)
     except Exception as error:
         try:
@@ -463,6 +600,7 @@ def main() -> int:
     finally:
         if initialized:
             ole.CoUninitialize()
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(stop_event))
         ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
     return 0
 

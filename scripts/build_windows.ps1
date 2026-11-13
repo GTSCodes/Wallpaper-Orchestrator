@@ -9,6 +9,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$identity = Join-Path $repo 'src\wallpaper_orchestrator\bundle_identity.py'
+$originalIdentity = $null
 if (-not $IsWindows -and $env:OS -ne 'Windows_NT') {
     throw 'C8 Windows executable builds must run on Windows.'
 }
@@ -36,6 +38,16 @@ try {
         throw "Previous portable build exists at $portable. Move it aside before rebuilding."
     }
 
+    # The compiled executable is unambiguously identified to all bundled
+    # modules, even if Nuitka does not inject __compiled__ into a module.
+    $originalIdentity = [System.IO.File]::ReadAllText($identity)
+    [System.IO.File]::WriteAllText(
+        $identity,
+        '"""Build-time marker; scripts/build_windows.ps1 restores the source."""' + "`n" +
+        'IS_STANDALONE_BUNDLE = True' + "`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
     $compileOptions = @(
         '--mode=standalone',
         '--enable-plugin=pyside6',
@@ -49,8 +61,15 @@ try {
     )
     python -m nuitka @compileOptions
     if ($LASTEXITCODE -ne 0) { throw 'Nuitka build failed.' }
-    if (-not (Test-Path (Join-Path $bundle 'WallpaperOrchestrator.exe'))) {
+    $compiledExe = Join-Path $bundle 'WallpaperOrchestrator.exe'
+    if (-not (Test-Path $compiledExe)) {
         throw 'Nuitka did not create the expected standalone executable.'
+    }
+    # Detect a broken packaged launcher BEFORE copying/publishing the build.
+    $smoke = Start-Process -FilePath $compiledExe -ArgumentList '--self-test' -Wait -PassThru
+    if ($smoke.ExitCode -ne 0) {
+        $diagnostic = Join-Path $env:LOCALAPPDATA 'WallpaperOrchestrator\self-test-startup-error.txt'
+        throw "Nuitka standalone self-test exited $($smoke.ExitCode). See $diagnostic"
     }
 
     New-Item -ItemType Directory -Path (Split-Path $portable -Parent) -Force | Out-Null
@@ -60,5 +79,10 @@ try {
     Write-Host 'Run WallpaperOrchestrator.exe --self-test before publishing.'
 }
 finally {
+    if ($null -ne $originalIdentity) {
+        [System.IO.File]::WriteAllText(
+            $identity, $originalIdentity, [System.Text.UTF8Encoding]::new($false)
+        )
+    }
     Pop-Location
 }

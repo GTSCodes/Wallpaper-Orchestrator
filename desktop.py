@@ -1,4 +1,4 @@
-"""Windows executable entry point for Wallpaper Orchestrator (Nuitka)."""
+"""Nuitka entry point for Wallpaper Orchestrator's GUI and background worker."""
 
 from wallpaper_orchestrator.desktop_entry import main
 

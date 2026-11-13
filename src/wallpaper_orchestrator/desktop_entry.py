@@ -59,8 +59,19 @@ def _self_test() -> int:
     from PySide6.QtWidgets import QApplication  # noqa: F401
     from wallpaper_orchestrator.platforms.windows import IDesktopWallpaper  # noqa: F401
     from wallpaper_orchestrator.gui import WallpaperWindow  # noqa: F401
-    from wallpaper_orchestrator.background import agent_launch_arguments
-    assert agent_launch_arguments(compiled=True)[-1] == "--background-agent"
+    from wallpaper_orchestrator.bundle_identity import IS_STANDALONE_BUNDLE
+    from wallpaper_orchestrator.background import (
+        _native_process_executable, agent_launch_arguments,
+    )
+    # A bundled smoke test must verify the REAL runtime selection, not force
+    # compiled=True (which allowed the previous detection bug to go unnoticed).
+    if not IS_STANDALONE_BUNDLE:
+        raise RuntimeError("Standalone bundle identity is missing from the build")
+    command = agent_launch_arguments()
+    if command != [str(_native_process_executable()), "--background-agent"]:
+        raise RuntimeError(f"Bundled background launch command is incorrect: {command}")
+    if not Path(command[0]).is_file():
+        raise FileNotFoundError(f"Packaged launcher is missing: {command[0]}")
     return 0
 
 
@@ -71,7 +82,29 @@ def main(argv: list[str] | None = None) -> int:
     if args == ["--background-agent"]:
         return _run_background()
     if args == ["--self-test"]:
-        return _self_test()
+        try:
+            return _self_test()
+        except Exception as error:
+            _record_startup_failure("self-test", error)
+            return 1
+    if args == ["--stop-agent"]:
+        try:
+            from wallpaper_orchestrator.background import stop_agent
+            return 0 if stop_agent() else 1
+        except Exception as error:
+            _record_startup_failure("background-stop", error)
+            return 1
+    if args == ["--repair-startup"]:
+        try:
+            from wallpaper_orchestrator.automation import load_automation
+            from wallpaper_orchestrator.background import install_startup, start_agent
+            if load_automation().background_enabled:
+                install_startup()
+                start_agent()
+            return 0
+        except Exception as error:
+            _record_startup_failure("background-repair", error)
+            return 1
     if args == ["--disable-background"]:
         try:
             from wallpaper_orchestrator.background import set_background_enabled
@@ -81,5 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             _record_startup_failure("background", error)
             return 1
     raise SystemExit(
-        "Usage: WallpaperOrchestrator.exe [--background-agent | --self-test | --disable-background]"
+        "Usage: WallpaperOrchestrator.exe "
+        "[--background-agent | --self-test | --stop-agent | "
+        "--repair-startup | --disable-background]"
     )
