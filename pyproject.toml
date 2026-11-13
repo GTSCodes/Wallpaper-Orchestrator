@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wallpaper-orchestrator"
-version = "0.8.0a1"
+version = "0.8.0b2"
 description = "A configurable multi-monitor wallpaper manager"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -58,7 +58,7 @@ from wallpaper_orchestrator.automation import (
     advance_intervals, automation_path, due_intervals, load_automation,
     record_interval_results, resolve_interval_targets, save_automation,
 )
-from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.catalog import WallpaperCatalog, SCHEMA_VERSION
 from wallpaper_orchestrator.calendar_rules import load_calendar_rules
 from wallpaper_orchestrator.indexer import scan_folder
 from wallpaper_orchestrator.profiles import load_profiles, save_profiles
@@ -292,8 +292,12 @@ def set_background_enabled(enabled: bool) -> None:
         if enabled:
             install_startup()
         save_automation(replace(original, background_enabled=enabled))
-        if enabled:
-            start_agent()  # Singleton mutex prevents duplicate running agents.
+        if enabled and not load_automation().paused:
+            # A prior installed beta may still hold the agent singleton and
+            # repeatedly fail to read schema v3. Replace it cooperatively.
+            _stop_incompatible_agent()
+            if not agent_alive():
+                start_agent()
         else:
             uninstall_startup()
     except Exception:
@@ -318,6 +322,10 @@ def _write_status(message: str, *, running: bool = True) -> None:
         temporary.write_text(json.dumps({
             "pid": os.getpid(), "heartbeat_utc": time.time(),
             "running": running, "message": message,
+            # The source of truth is the running worker, not the GUI's Python
+            # version or a stale startup registry path.
+            "agent_executable": str(_native_process_executable()),
+            "catalogue_schema_version": SCHEMA_VERSION,
         }), encoding="utf-8")
         temporary.replace(path)
     finally:
@@ -344,6 +352,45 @@ def agent_alive(*, now: float | None = None) -> bool:
     )
 
 
+def agent_is_current(*, status: dict | None = None) -> bool:
+    """True only for a live worker built from this runtime/schema.
+
+    Earlier beta workers lack these status fields. They can read automation
+    rules but cannot scan a catalogue upgraded to version 3.
+    """
+    health = status if status is not None else read_status()
+    if not health.get("running") or not agent_alive():
+        return False
+    current_command = agent_launch_arguments()
+    expected = os.path.normpath(current_command[0]).casefold()
+    actual = health.get("agent_executable")
+    return (isinstance(actual, str) and
+            os.path.normpath(actual).casefold() == expected and
+            health.get("catalogue_schema_version") == SCHEMA_VERSION)
+
+
+def _stop_incompatible_agent() -> None:
+    """Ask obsolete installed/portable workers to release their singleton."""
+    if agent_alive() and not agent_is_current():
+        if not stop_agent():
+            raise RuntimeError(
+                "An outdated background agent is still running. Close old "
+                "Wallpaper Orchestrator copies before enabling automation."
+            )
+
+
+def ensure_current_agent() -> None:
+    """Repair HKCU startup and replace an outdated agent, respecting pause."""
+    config = load_automation()
+    if config.paused or not config.background_enabled:
+        return  # Never undo Restore Previous Wallpapers or explicit opt-out.
+    _stop_incompatible_agent()
+    # Rebind a stale Windows Run entry to the copy the user actually launched.
+    install_startup()
+    if not agent_is_current():
+        start_agent()
+
+
 def agent_health_text(*, now: float | None = None) -> str:
     """Short, user-facing health report; safe when no agent has ever started."""
     status = read_status()
@@ -351,6 +398,10 @@ def agent_health_text(*, now: float | None = None) -> str:
     heartbeat = status.get("heartbeat_utc")
     detail = str(status.get("message") or "No status reported")
     if agent_alive(now=moment):
+        if not agent_is_current():
+            return ("Outdated or different background agent is running. "
+                    "Close old copies or install the updated release "
+                    f"(catalogue schema {SCHEMA_VERSION}).")
         return f"Running — {detail}"
     if isinstance(heartbeat, (int, float)) and heartbeat <= moment:
         age = int(moment - heartbeat)

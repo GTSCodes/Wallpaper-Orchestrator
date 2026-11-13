@@ -16,7 +16,29 @@ from wallpaper_orchestrator.automation import automation_path, load_automation, 
 
 
 def restore_point_path() -> Path:
+    """Legacy/custom restore point: users may explicitly replace this snapshot."""
     return automation_path().with_name("wallpaper-restore-point.json")
+
+
+def first_restore_point_path() -> Path:
+    """The application-managed, write-once first-launch baseline."""
+    return automation_path().with_name("wallpaper-first-restore-point.json")
+
+
+def read_first_restore_point(path: Path | None = None) -> dict[str, str | None] | None:
+    """Read the permanent first-launch snapshot, independently of custom ones."""
+    return read_restore_point(path if path is not None else first_restore_point_path())
+
+
+def capture_first_restore_point(discover, get_wallpaper, *,
+                                path: Path | None = None) -> bool:
+    """Automatically capture once; never replace the first snapshot.
+
+    A failed discovery or corrupt existing baseline raises rather than allowing
+    an invisible wallpaper change to defeat the user's safety net.
+    """
+    return capture_wallpapers(discover, get_wallpaper,
+                              path=path if path is not None else first_restore_point_path())
 
 
 def read_restore_point(path: Path | None = None) -> dict[str, str | None] | None:

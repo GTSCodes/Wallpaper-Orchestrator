@@ -60,6 +60,9 @@ def _self_test() -> int:
     from wallpaper_orchestrator.platforms.windows import IDesktopWallpaper  # noqa: F401
     from wallpaper_orchestrator.gui import WallpaperWindow  # noqa: F401
     from wallpaper_orchestrator.bundle_identity import IS_STANDALONE_BUNDLE
+    from wallpaper_orchestrator.catalog import SCHEMA_VERSION
+    if SCHEMA_VERSION != 3:
+        raise RuntimeError("Bundle has an outdated catalogue schema; rebuild it")
     from wallpaper_orchestrator.background import (
         _native_process_executable, agent_launch_arguments,
     )
@@ -97,10 +100,18 @@ def main(argv: list[str] | None = None) -> int:
     if args == ["--repair-startup"]:
         try:
             from wallpaper_orchestrator.automation import load_automation
-            from wallpaper_orchestrator.background import install_startup, start_agent
-            if load_automation().background_enabled:
-                install_startup()
-                start_agent()
+            from wallpaper_orchestrator.background import (
+                ensure_current_agent, stop_agent, uninstall_startup,
+            )
+            config = load_automation()
+            # Upgrades must clean stale Windows Run entries from previous beta
+            # agents, but never silently resume an explicit restoration pause.
+            if config.background_enabled and not config.paused:
+                ensure_current_agent()
+            else:
+                uninstall_startup()
+                if not stop_agent():
+                    raise RuntimeError("Old background agent did not stop during upgrade")
             return 0
         except Exception as error:
             _record_startup_failure("background-repair", error)

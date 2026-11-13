@@ -12,9 +12,10 @@ from PySide6.QtWidgets import (
     QWizardPage,
 )
 
-from wallpaper_orchestrator.automation import load_automation, save_automation, set_interval
+from wallpaper_orchestrator.automation import automation_path, load_automation, save_automation, set_interval
 from wallpaper_orchestrator.background import set_background_enabled
 from wallpaper_orchestrator.monitor_labels import monitor_labels
+from wallpaper_orchestrator.onboarding_state import default_background_for_setup
 from wallpaper_orchestrator.profiles import default_profile, load_profiles, save_profiles
 
 
@@ -99,8 +100,19 @@ class FirstRunWizard(QWizard):
             "Shuffling runs in a separate background process, even after closing the app.",
         )
         self.automate = QCheckBox("Automatically shuffle these displays")
-        self.automate.setChecked(False)  # Never create a new automation silently.
+        self.automate.setChecked(False)  # Never create an interval without consent.
         layout.addWidget(self.automate)
+        self.background = QCheckBox(
+            "Keep enabled automations running after closing the app "
+            "(start with Windows)"
+        )
+        # Enabled for genuinely new installs only. Existing users' explicit
+        # choices, and a safety-restoration pause, must not be overwritten.
+        existing = load_automation()
+        self.background.setChecked(default_background_for_setup(
+            existing, saved_preference_exists=automation_path().exists()
+        ))
+        layout.addWidget(self.background)
         frequency = QFormLayout()
         self.minutes = QSpinBox()
         self.minutes.setRange(1, 10080)
@@ -111,9 +123,10 @@ class FirstRunWizard(QWizard):
         frequency.addRow("Shuffle every", self.minutes)
         layout.addLayout(frequency)
         note = QLabel(
-            "Enabling this also opts in to starting the background agent at Windows "
-            "sign-in. Existing interval conflict rules still apply. You can pause or "
-            "edit the automation later in Schedules."
+            "Background startup is selected by default for new users and "
+            "applied when you finish setup. Uncheck it to opt out. "
+            "Automatic shuffle is separate: no interval is created until "
+            "you select it. Existing pause settings and interval conflicts remain."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -179,7 +192,10 @@ class FirstRunWizard(QWizard):
                 config = set_interval(load_automation(), list(self.monitor_folders),
                                       self.minutes.value() * 60)
                 save_automation(config)
-                set_background_enabled(True)
+            # Apply the visible preference even if the user configured no
+            # interval yet. Never automatically clear a previous safety pause.
+            if self.background.isChecked() != load_automation().background_enabled:
+                set_background_enabled(self.background.isChecked())
             self.window.settings.setValue("setup/finished", True)
             self.window.settings.sync()
             self.window.profiles = profiles

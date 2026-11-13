@@ -1,6 +1,6 @@
 ; C8.2 per-user Inno Setup installer. Build portable bundle first.
 #define MyAppName "Wallpaper Orchestrator"
-#define MyAppVersion "0.8.0a1"
+#define MyAppVersion "0.8.0b2"
 #define MyAppExeName "WallpaperOrchestrator.exe"
 
 [Setup]
@@ -44,7 +44,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: po
 
 [UninstallRun]
 ; Signal the standalone agent without deleting automation.json or the library.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--stop-agent"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--stop-agent"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopWallpaperAgent"
 
 [Code]
 const

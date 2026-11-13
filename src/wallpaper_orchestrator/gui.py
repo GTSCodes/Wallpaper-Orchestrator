@@ -45,7 +45,7 @@ from wallpaper_orchestrator.automation import (
 from wallpaper_orchestrator.automation_view import AutomateDialog
 from wallpaper_orchestrator.background import (
     agent_alive, agent_health_text, apply_due_in_foreground_if_agent_missing,
-    install_startup, start_agent, uninstall_startup,
+    ensure_current_agent, install_startup, start_agent, stop_agent, uninstall_startup,
 )
 from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.library_view import LibraryPanel
@@ -426,8 +426,22 @@ class WallpaperWindow(QMainWindow):
 
         # Keep the existing global library preference from older GUI versions.
         self.settings = QSettings("WallpaperOrchestrator", "WallpaperOrchestrator")
+        # Decide whether this is a genuinely new installation before LibraryPanel
+        # creates catalog.sqlite3. A freshly generated database must not make a
+        # new user look like an existing user and suppress the setup wizard.
+        from wallpaper_orchestrator.onboarding_state import should_offer_setup
+        self._offer_first_run_setup = should_offer_setup(self.settings)
         self.mapping = load_monitor_mapping()
         self.monitors = discover_monitors()
+        # Save the original setup on the first launch, BEFORE timers or a
+        # setup wizard can apply a wallpaper. Never overwrite this snapshot.
+        from wallpaper_orchestrator.restore_points import capture_first_restore_point
+        self._first_restore_error = None
+        try:
+            capture_first_restore_point(lambda: self.monitors, get_monitor_wallpaper)
+        except (OSError, RuntimeError, ValueError) as error:
+            # The Windows setter also refuses changes until capture works.
+            self._first_restore_error = str(error)
         self.profiles = load_profiles()
         self.selected_device_id = None
         self.selected_device_ids = []
@@ -441,9 +455,11 @@ class WallpaperWindow(QMainWindow):
         setup_menu = self.menuBar().addMenu("Setup")
         setup_menu.addAction("Run setup wizard…", self.run_setup_wizard)
         setup_menu.addSeparator()
-        setup_menu.addAction("Save current wallpapers as restore point…",
+        setup_menu.addAction("Save current wallpapers as custom restore point…",
                              self._save_restore_point)
-        setup_menu.addAction("Restore previous wallpapers and pause automations…",
+        setup_menu.addAction("Restore First Restore Point and pause automations…",
+                             self._restore_first_wallpapers)
+        setup_menu.addAction("Restore custom restore point and pause automations…",
                              self._restore_previous_wallpapers)
 
         self.tabs = QTabWidget()
@@ -706,10 +722,16 @@ class WallpaperWindow(QMainWindow):
         else:
             self.monitor_selected()
         QTimer.singleShot(0, self._maybe_first_run_setup)
+        if self._first_restore_error:
+            QTimer.singleShot(100, lambda: QMessageBox.warning(
+                self, "Wallpaper safety snapshot unavailable",
+                "Wallpaper Orchestrator could not save your First Restore Point. "
+                "Wallpaper changes are blocked until Windows can provide the "
+                f"original desktop setup.\n\n{self._first_restore_error}"))
 
     def _maybe_first_run_setup(self):
-        from wallpaper_orchestrator.onboarding_state import should_offer_setup
-        if should_offer_setup(self.settings):
+        if self._offer_first_run_setup:
+            self._offer_first_run_setup = False  # Only open once per GUI launch.
             self.run_setup_wizard()
 
     def run_setup_wizard(self):
@@ -717,7 +739,7 @@ class WallpaperWindow(QMainWindow):
         FirstRunWizard(self).exec()
 
     def _save_restore_point(self):
-        """Explicit replacement of the safety baseline is a user-only action."""
+        """Custom snapshots can be replaced; the First Restore Point never can."""
         from wallpaper_orchestrator.restore_points import (
             capture_wallpapers, read_restore_point,
         )
@@ -746,25 +768,35 @@ class WallpaperWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Restore point", str(error))
 
+    def _restore_first_wallpapers(self):
+        """Permanent first-launch baseline cannot be replaced from the GUI."""
+        from wallpaper_orchestrator.restore_points import read_first_restore_point
+        self._restore_wallpapers_from(read_first_restore_point, "First Restore Point")
+
     def _restore_previous_wallpapers(self):
-        """Pause scheduling before returning connected displays to baseline."""
+        """Keep pre-C8.2.2 manual restore points usable as custom snapshots."""
+        from wallpaper_orchestrator.restore_points import read_restore_point
+        self._restore_wallpapers_from(read_restore_point, "custom restore point")
+
+    def _restore_wallpapers_from(self, reader, label):
+        """Stop all scheduling before restoring the selected snapshot."""
         from wallpaper_orchestrator.restore_points import (
-            pause_for_restore, read_restore_point, restore_wallpapers,
+            pause_for_restore, restore_wallpapers,
         )
         try:
-            saved = read_restore_point()
+            saved = reader()
             if saved is None:
                 QMessageBox.information(
                     self, "No restore point",
-                    "No previous wallpapers have been saved yet. "
-                    "You can save the current desktop from the Setup menu."
+                    f"No {label} exists yet. Your wallpapers were not changed."
                 )
                 return
             result = QMessageBox.question(
-                self, "Restore previous wallpapers",
+                self, f"Restore {label}",
+                f"Restore wallpapers from {label}?\n\n"
                 "Stop background automation, pause ALL interval, daily and "
                 "seasonal automations, and restore the saved wallpaper images "
-                "to connected displays?\n\n"
+                "to connected displays.\n\n"
                 "Your collections, rules and original image files will "
                 "remain unchanged. You can resume automation later.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1015,12 +1047,20 @@ class WallpaperWindow(QMainWindow):
     def _ensure_background_agent(self):
         """Start the login agent when enabled, without spawning duplicates."""
         try:
-            if not load_automation().background_enabled or agent_alive():
+            config = load_automation()
+            # An opt-out or Restore Previous Wallpapers must also clean up
+            # stale registry entries/old beta workers left by an older install.
+            if not config.background_enabled:
+                uninstall_startup()
+                if agent_alive() and not stop_agent():
+                    raise RuntimeError("Background agent did not stop after opt-out")
                 return
+            if config.paused:
+                return  # Never silently resume a deliberate pause.
             if time.monotonic() - self._last_agent_launch < 45:
                 return
             self._last_agent_launch = time.monotonic()
-            start_agent()
+            ensure_current_agent()
         except Exception as error:
             self.schedules_panel.report_result(
                 f"Cannot start background wallpaper automation: {error}"
