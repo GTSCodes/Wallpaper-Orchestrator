@@ -75,6 +75,20 @@ def _read_metadata(path: Path, before: os.stat_result) -> ImageMetadata:
     )
 
 
+def read_image_metadata(path: str | Path) -> ImageMetadata:
+    """Validate one explicitly supplied image using the folder indexer's rules.
+
+    Manual imports need not belong to any folder link.  Reject symbolic links
+    and unsupported formats, then verify the file before cataloguing it.
+    """
+    image_path = Path(path)
+    if image_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"Unsupported wallpaper format: {image_path.name}")
+    if image_path.is_symlink() or not image_path.is_file():
+        raise ValueError(f"Image is unavailable or a symbolic link: {image_path}")
+    return _read_metadata(image_path, image_path.stat())
+
+
 def resolve_folder_link(catalog: WallpaperCatalog, folder_link_id: str) -> FolderLink:
     """Find a linked folder, including catalogues from early B1 versions.
 

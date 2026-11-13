@@ -48,9 +48,10 @@ from wallpaper_orchestrator.indexer import resolve_folder_link, scan_all, scan_f
 from wallpaper_orchestrator.watcher import FolderChangeDetector
 from wallpaper_orchestrator.library_c6_view import (
     DuplicateScanWorker, FolderDefaultsDialog, ImageDropGrid, ImageDropTable, ImportWorker,
-    SmartCollectionsDialog, TagFilterDialog,
+    ManualImportWorker, SmartCollectionsDialog, TagFilterDialog,
 )
 from wallpaper_orchestrator.indexer import SUPPORTED_EXTENSIONS
+from wallpaper_orchestrator.library_tools import ManualImportReport
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -1003,32 +1004,42 @@ class LibraryPanel(QWidget):
             self._error(str(error))
             return
         if not links:
-            QMessageBox.information(
-                self, "Import Images", "This collection has no available linked folder. "
-                "Use + Folder to link an existing destination first.",
-            )
-            return
-        chosen = next((link for link in links if link.id == self.selected_folder_id()), None)
-        if chosen is None and len(links) > 1:
-            choices = [str(link.path) for link in links]
-            name, accepted = QInputDialog.getItem(
-                self, "Import destination", "Copy images into:", choices, 0, False,
-            )
-            if not accepted:
+            if QMessageBox.question(
+                self, "Import Wallpapers",
+                f"Add {len(incoming)} image(s) to this collection from their existing locations?\n\n"
+                "No files will be copied or moved. Keep the originals in place so "
+                "Wallpaper Orchestrator can continue to use them.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            ) != QMessageBox.StandardButton.Yes:
                 return
-            chosen = links[choices.index(name)]
-        chosen = chosen or links[0]
-        if QMessageBox.question(
-            self, "Import Wallpapers",
-            f"Copy {len(incoming)} image(s) to:\n{chosen.path}\n\n"
-            "Original files will remain where they are. Existing files will not be overwritten.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        self._import_folder_id = chosen.id
+            self._import_folder_id = None
+            worker = ManualImportWorker(incoming, collection_id)
+            progress = f"Adding {len(incoming)} image(s) from their existing locations…"
+        else:
+            chosen = next((link for link in links if link.id == self.selected_folder_id()), None)
+            if chosen is None and len(links) > 1:
+                choices = [str(link.path) for link in links]
+                name, accepted = QInputDialog.getItem(
+                    self, "Import destination", "Copy images into:", choices, 0, False,
+                )
+                if not accepted:
+                    return
+                chosen = links[choices.index(name)]
+            chosen = chosen or links[0]
+            if QMessageBox.question(
+                self, "Import Wallpapers",
+                f"Copy {len(incoming)} image(s) to:\n{chosen.path}\n\n"
+                "Original files will remain where they are. Existing files will not be overwritten.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self._import_folder_id = chosen.id
+            worker = ImportWorker(incoming, chosen.path)
+            progress = f"Copying {len(incoming)} image(s) in the background…"
         self._import_thread = QThread(self)
-        self._import_worker = ImportWorker(incoming, chosen.path)
+        self._import_worker = worker
         self._import_worker.moveToThread(self._import_thread)
         self._import_thread.started.connect(self._import_worker.run)
         self._import_worker.completed.connect(self._import_completed)
@@ -1038,11 +1049,19 @@ class LibraryPanel(QWidget):
         self._import_thread.finished.connect(self._import_worker.deleteLater)
         self._import_thread.finished.connect(self._import_thread.deleteLater)
         self._import_thread.finished.connect(self._import_finished)
-        self.status.setText(f"Copying {len(incoming)} image(s) in the background…")
+        self.status.setText(progress)
         self._sync_buttons()
         self._import_thread.start()
 
     def _import_completed(self, report):
+        if isinstance(report, ManualImportReport):
+            self.status.setText(
+                f"Added {len(report.imported)} image(s) from their existing locations; "
+                f"skipped {len(report.skipped)}. No files were copied or moved."
+            )
+            if report.skipped:
+                QMessageBox.information(self, "Import Details", "\n".join(report.skipped[:10]))
+            return
         if self._import_folder_id and report.copied:
             self._pending_auto_ids.add(self._import_folder_id)
         self.status.setText(
@@ -1055,7 +1074,9 @@ class LibraryPanel(QWidget):
     def _import_failed(self, message):
         if self._import_folder_id:
             self._pending_auto_ids.add(self._import_folder_id)
-        self.status.setText("Import was interrupted; any successfully copied files will be indexed.")
+            self.status.setText("Import was interrupted; any successfully copied files will be indexed.")
+        else:
+            self.status.setText("Import was interrupted; original files were not changed.")
         self._error(message)
 
     def _import_finished(self):
@@ -1064,7 +1085,9 @@ class LibraryPanel(QWidget):
         self._import_worker = None
         self._import_folder_id = None
         self._sync_buttons()
-        if folder_id and not self.auto_scan_checkbox.isChecked():
+        if not folder_id:
+            self._collection_changed()
+        elif not self.auto_scan_checkbox.isChecked():
             self._pending_auto_ids.discard(folder_id)
             self._start_scan(None, folder_ids=(folder_id,), automatic=False)
         elif self._pending_auto_ids:
