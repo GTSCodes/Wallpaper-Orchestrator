@@ -132,6 +132,13 @@ def set_monitor_wallpaper(
     from wallpaper_orchestrator.restore_points import capture_wallpapers
     capture_wallpapers(discover_monitors, get_monitor_wallpaper)
 
+    # One central guard covers GUI actions, Library Apply and the background
+    # worker. Capture all connected monitors BEFORE changing the first one.
+    # If Windows cannot provide the original state, fail closed rather than
+    # destroying the user's only chance to restore their wallpaper setup.
+    from wallpaper_orchestrator.restore_points import capture_first_restore_point
+    capture_first_restore_point(discover_monitors, get_monitor_wallpaper)
+
     desktop = CreateObject(
         "{C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}",
         interface=IDesktopWallpaper,

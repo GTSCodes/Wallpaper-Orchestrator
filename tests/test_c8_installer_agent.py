@@ -141,18 +141,27 @@ class RuntimeModeTests(unittest.TestCase):
         from wallpaper_orchestrator.automation import AutomationConfig
         with patch("wallpaper_orchestrator.automation.load_automation",
                    return_value=AutomationConfig(background_enabled=False)), \
-             patch.object(background, "install_startup") as install, \
-             patch.object(background, "start_agent") as launch:
+             patch.object(background, "ensure_current_agent") as repair, \
+             patch.object(background, "uninstall_startup") as uninstall, \
+             patch.object(background, "stop_agent", return_value=True) as stop:
             self.assertEqual(desktop_entry.main(["--repair-startup"]), 0)
-            install.assert_not_called()
-            launch.assert_not_called()
+            repair.assert_not_called()
+            uninstall.assert_called_once()
+            stop.assert_called_once()
         with patch("wallpaper_orchestrator.automation.load_automation",
                    return_value=AutomationConfig(background_enabled=True)), \
-             patch.object(background, "install_startup") as install, \
-             patch.object(background, "start_agent") as launch:
+             patch.object(background, "ensure_current_agent") as repair:
             self.assertEqual(desktop_entry.main(["--repair-startup"]), 0)
-            install.assert_called_once()
-            launch.assert_called_once()
+            repair.assert_called_once()
+        with patch("wallpaper_orchestrator.automation.load_automation",
+                   return_value=AutomationConfig(background_enabled=True, paused=True)), \
+             patch.object(background, "ensure_current_agent") as repair, \
+             patch.object(background, "uninstall_startup") as uninstall, \
+             patch.object(background, "stop_agent", return_value=True) as stop:
+            self.assertEqual(desktop_entry.main(["--repair-startup"]), 0)
+            repair.assert_not_called()
+            uninstall.assert_called_once()
+            stop.assert_called_once()
 
     def test_failed_self_test_writes_diagnostic_instead_of_silent_exit(self):
         with patch.object(desktop_entry, "_self_test", side_effect=RuntimeError("missing executable")), \
