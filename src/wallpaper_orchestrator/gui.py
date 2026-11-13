@@ -39,7 +39,8 @@ from PySide6.QtWidgets import (
 
 from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
 from wallpaper_orchestrator.automation import (
-    load_automation, matching_rule, remove_interval, save_automation, set_interval,
+    load_automation, matching_rule, overlapping_intervals, remove_interval,
+    save_automation, set_interval,
 )
 from wallpaper_orchestrator.automation_view import AutomateDialog
 from wallpaper_orchestrator.background import (
@@ -48,6 +49,7 @@ from wallpaper_orchestrator.background import (
 )
 from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.library_view import LibraryPanel
+from wallpaper_orchestrator.intelligence_view import IntelligenceDialog
 from wallpaper_orchestrator.schedule_view import SchedulesPanel
 from wallpaper_orchestrator.scheduler import resolve_targets
 from wallpaper_orchestrator.platforms.windows import (
@@ -432,6 +434,12 @@ class WallpaperWindow(QMainWindow):
         self.monitor_items = {}
         self._restoring = False
         self._last_agent_launch = 0.0
+        self._tray_controller = None
+        self._tray_exit_requested = False
+
+        # Reopenable guided setup; avoid reorganising the existing advanced UI.
+        setup_menu = self.menuBar().addMenu("Setup")
+        setup_menu.addAction("Run setup wizard…", self.run_setup_wizard)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
@@ -481,6 +489,14 @@ class WallpaperWindow(QMainWindow):
             self.settings.value("cross_monitor_limits_enabled", False, type=bool)
         )
         display_row.addWidget(self.cross_monitor_limits)
+        self.intelligence_button = QPushButton("Selection rules…")
+        self.intelligence_button.setObjectName("quietButton")
+        self.intelligence_button.setToolTip(
+            "Configure recent-image history, collection/tag limits, monitor "
+            "groups and smart collections."
+        )
+        self.intelligence_button.clicked.connect(self.configure_intelligence)
+        display_row.addWidget(self.intelligence_button)
         self.automate_button = QPushButton("Automate")
         self.automate_button.setObjectName("quietButton")
         self.automate_button.setToolTip(
@@ -684,6 +700,16 @@ class WallpaperWindow(QMainWindow):
             self.monitor_items[self.monitors[0].device_id].setSelected(True)
         else:
             self.monitor_selected()
+        QTimer.singleShot(0, self._maybe_first_run_setup)
+
+    def _maybe_first_run_setup(self):
+        from wallpaper_orchestrator.onboarding_state import should_offer_setup
+        if should_offer_setup(self.settings):
+            self.run_setup_wizard()
+
+    def run_setup_wizard(self):
+        from wallpaper_orchestrator.setup_wizard import FirstRunWizard
+        FirstRunWizard(self).exec()
 
     def _watch_screen(self, screen):
         """Watch movement, resizing and rotation of an existing Qt screen."""
@@ -810,7 +836,10 @@ class WallpaperWindow(QMainWindow):
     def _schedule_tick(self):
         """Check wall-clock time (including missed times after PC sleep)."""
         try:
-            if load_automation().background_enabled:
+            automation = load_automation()
+            if automation.paused:
+                return
+            if automation.background_enabled:
                 # C3 silently abandoned the GUI timer as soon as the *setting*
                 # was enabled, even if pythonw.exe failed to launch. Keep
                 # the interface useful while an agent is unavailable. The
@@ -982,6 +1011,8 @@ class WallpaperWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Automation Error", str(error))
             return
+        conflicting = (overlapping_intervals(original, ids)
+                       if dialog.action == "save" else ())
         try:
             updated = (
                 remove_interval(original, ids) if dialog.action == "remove"
@@ -1018,9 +1049,22 @@ class WallpaperWindow(QMainWindow):
             self.status.setText(
                 f"Automating {display_count_text(len(ids))} every "
                 f"{dialog.number.value()} {dialog.unit.currentText().lower()}."
+                + (f" Paused {len(conflicting)} overlapping interval(s)."
+                   if conflicting else "")
             )
             if dialog.run_now.isChecked():
                 self.change_selection()
+
+    def configure_intelligence(self):
+        """Keep C5's advanced controls in one dedicated dialog."""
+        try:
+            dialog = IntelligenceDialog(self.monitors, self.mapping, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.library_panel.refresh_collections()
+                self.update_collection_summary()
+                self.status.setText("Intelligent selection rules saved for the next shuffle.")
+        except (ValueError, OSError) as error:
+            QMessageBox.critical(self, "Selection Rules", str(error))
 
     def toggle_select_all(self):
         select = len(self.selected_device_ids) != len(self.monitors)
@@ -1352,8 +1396,41 @@ class WallpaperWindow(QMainWindow):
         self.refresh_wallpaper_previews(force=True)
         self.status.setText(result)
 
+    def shuffle_all_displays(self):
+        """Tray action: target all active non-fixed displays, not GUI selection."""
+        try:
+            self.refresh_monitors()
+            ids = [monitor.device_id for monitor in self.monitors
+                   if self.profiles.get(monitor.device_id, {}).get("mode", "folder") != "fixed"]
+            if not ids:
+                return "No eligible displays to shuffle (fixed images are unchanged)."
+            shared = self.library_path.text()
+            assignments, device_ids = create_profile_plan(
+                Path(shared) if shared else None, self.profiles,
+                selected_device_ids=ids,
+                respect_theme_limits=self.cross_monitor_limits.isChecked(),
+            )
+            apply_plan(assignments, device_ids)
+            for device_id, wallpaper in assignments.items():
+                self.profiles.setdefault(device_id, default_profile())[
+                    "last_image"
+                ] = str(wallpaper.path)
+            save_profiles(self.profiles)
+            self.refresh_wallpaper_previews(force=True)
+            message = f"Shuffled {display_count_text(len(assignments))}."
+            self.status.setText(message)
+            return message
+        except Exception as error:
+            self.status.setText(f"Shuffle all failed: {error}")
+            raise
+
     def closeEvent(self, event):
-        """Let scans finish before closing, then stop folder monitoring."""
+        """Window X hides to tray; explicit Exit stops GUI, never the agent."""
+        if (self._tray_controller is not None and
+                self._tray_controller.available and not self._tray_exit_requested):
+            self.hide()
+            event.ignore()
+            return
         if self.library_panel.scan_running():
             QMessageBox.information(
                 self, "Library Scan Running",
@@ -1369,6 +1446,10 @@ class WallpaperWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     window = WallpaperWindow()
+    from wallpaper_orchestrator.tray import WallpaperTray
+    window._tray_controller = WallpaperTray(window)
+    if window._tray_controller.available:
+        app.setQuitOnLastWindowClosed(False)
     window.show()
     return app.exec()
 

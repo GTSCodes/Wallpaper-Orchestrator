@@ -42,24 +42,31 @@ if __name__ == "__main__":
     _startup_sys.excepthook = _report_unhandled_error
 
 import ctypes
+from dataclasses import replace
 from datetime import datetime
 import json
 import os
+import traceback
 from pathlib import Path
 import subprocess
 import sys
 import time
 from uuid import uuid4
 
+from wallpaper_orchestrator.bundle_identity import IS_STANDALONE_BUNDLE
 from wallpaper_orchestrator.automation import (
     advance_intervals, automation_path, due_intervals, load_automation,
     record_interval_results, resolve_interval_targets, save_automation,
 )
 from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.calendar_rules import load_calendar_rules
 from wallpaper_orchestrator.indexer import scan_folder
 from wallpaper_orchestrator.profiles import load_profiles, save_profiles
 from wallpaper_orchestrator.scheduler import (
     due_rules, load_schedules, resolve_targets, save_schedules, stamp_attempts,
+)
+from wallpaper_orchestrator.seasonal_automation import (
+    SeasonDecision, evaluate_seasons, load_seasonal_state, save_seasonal_state,
 )
 from wallpaper_orchestrator.watcher import FolderChangeDetector
 
@@ -67,6 +74,7 @@ from wallpaper_orchestrator.watcher import FolderChangeDetector
 STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_NAME = "WallpaperOrchestratorAgent"
 MUTEX_NAME = r"Local\WallpaperOrchestratorAutomationAgent"
+STOP_EVENT_NAME = r"Local\WallpaperOrchestratorAgentStop"
 
 
 def _require_windows():
@@ -85,12 +93,62 @@ def _pythonw_path() -> Path:
     return silent
 
 
+def _native_process_executable() -> Path:
+    """Return the image Windows actually started, not Python's sys.executable.
+
+    Some frozen/Nuitka runtimes leave sys.executable pointing at a synthetic
+    python.exe inside the standalone folder. GetModuleFileNameW(NULL) obtains
+    the path of *this process's* executable directly from Windows instead.
+    """
+    if sys.platform != "win32":
+        # Allows deterministic tests and non-Windows source development.
+        return Path(sys.executable)
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_name = kernel.GetModuleFileNameW
+    get_name.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint]
+    get_name.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_name(None, buffer, len(buffer))
+    if not length:
+        raise OSError(ctypes.get_last_error(),
+                      "Windows could not determine the running executable")
+    if length >= len(buffer):
+        raise RuntimeError("The running executable path exceeds the Windows limit")
+    return Path(buffer.value)
+
+
+def agent_launch_arguments(
+    *, compiled: bool | None = None, executable: Path | None = None,
+    script: Path | None = None,
+) -> list[str]:
+    """Use this app's executable in compiled builds; Python in source builds.
+
+    The build script embeds a deterministic bundle marker. Nuitka's
+    ``__compiled__``, frozen flag and executable name are compatibility
+    fallbacks, not the primary means of detecting a packaged application.
+    """
+    if compiled is None:
+        compiled = (
+            IS_STANDALONE_BUNDLE
+            or "__compiled__" in globals()
+            or bool(getattr(sys, "frozen", False))
+            or _native_process_executable().name.casefold()
+            == "wallpaperorchestrator.exe"
+        )
+    if compiled:
+        # In a Nuitka standalone process sys.executable may be a nonexistent
+        # python.exe, so query the actual Windows module instead.
+        target = executable if executable is not None else _native_process_executable()
+        return [str(target), "--background-agent"]
+    return [str(executable or _pythonw_path()),
+            str(script or Path(__file__).resolve())]
+
+
 def startup_command() -> str:
-    """Absolute interpreter and script paths also work outside the repo cwd."""
+    """Register one background worker command for source and standalone builds."""
     _require_windows()
-    command = subprocess.list2cmdline([
-        str(_pythonw_path()), str(Path(__file__).resolve())
-    ])
+    command = subprocess.list2cmdline(agent_launch_arguments())
     if len(command) > 260:
         raise ValueError(
             "The startup path is too long for the Windows Run key. "
@@ -121,16 +179,131 @@ def uninstall_startup() -> None:
         pass
 
 
+def _launch_log_path() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
+    return root / "WallpaperOrchestrator" / "background-launch.log"
+
+
+def _record_launch_attempt(command: list[str], *, result: str,
+                           error: BaseException | None = None) -> None:
+    """Explain hidden-process failures without including wallpaper image paths.
+
+    A windowed Nuitka executable has no useful stderr, so this small file is
+    intentionally readable outside the application. It contains the launcher
+    and working directory, but never scans the user's wallpaper library.
+    """
+    try:
+        log = _launch_log_path()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        details = [
+            f"UTC: {datetime.now().astimezone().isoformat()}",
+            f"Result: {result}",
+            f"Standalone marker: {IS_STANDALONE_BUNDLE}",
+            f"Nuitka compiled flag: {'__compiled__' in globals()}",
+            f"Python sys.executable: {sys.executable}",
+            f"Windows process executable: {_native_process_executable()}",
+            f"Launcher exists: {Path(command[0]).is_file()}",
+            f"Command: {subprocess.list2cmdline(command)}",
+            f"Working directory: {os.getcwd()}",
+        ]
+        if error is not None:
+            details.extend((f"Error: {error}", "Traceback:",
+                            "".join(traceback.format_exception(error))))
+        # The most recent launch result is enough; avoid unbounded logs.
+        log.write_text("\n".join(details)[-12000:] + "\n", encoding="utf-8")
+    except Exception:
+        pass  # Diagnostics must never mask the actual launch exception.
+
+
 def start_agent() -> None:
-    """Launch a separate invisible Python process; singleton mutex dedupes."""
+    """Launch a separate invisible worker; its Windows mutex deduplicates."""
     _require_windows()
-    subprocess.Popen(
-        [str(_pythonw_path()), str(Path(__file__).resolve())],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, close_fds=True,
-        creationflags=(subprocess.DETACHED_PROCESS |
-                       subprocess.CREATE_NEW_PROCESS_GROUP),
-    )
+    command = agent_launch_arguments()
+    if not Path(command[0]).is_file():
+        error = FileNotFoundError(
+            f"The background launcher does not exist: {command[0]}. "
+            "Check that the correct executable was packaged and launched."
+        )
+        _record_launch_attempt(command, result="missing executable", error=error)
+        raise error
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True,
+            cwd=str(Path(command[0]).resolve().parent),
+            creationflags=(subprocess.DETACHED_PROCESS |
+                           subprocess.CREATE_NEW_PROCESS_GROUP),
+        )
+    except OSError as error:
+        _record_launch_attempt(command, result="process creation failed", error=error)
+        raise RuntimeError(
+            f"Cannot launch background agent: {error}. "
+            f"See {_launch_log_path()} for the command and traceback."
+        ) from error
+    _record_launch_attempt(command, result=f"created child PID {child.pid}")
+
+
+def _stop_event():
+    """Create one named event used solely to stop an agent during updates."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool,
+                                    ctypes.c_bool, ctypes.c_wchar_p]
+    kernel.CreateEventW.restype = ctypes.c_void_p
+    handle = kernel.CreateEventW(None, True, False, STOP_EVENT_NAME)
+    if not handle:
+        raise OSError("Cannot create background-agent stop event")
+    kernel.ResetEvent(ctypes.c_void_p(handle))
+    return handle
+
+
+def stop_agent(*, timeout: float = 15) -> bool:
+    """Ask the agent to exit without changing saved automation preferences.
+
+    Called by the installer before replacing files; there is no third-party
+    process killer, background Windows service or modification to user data.
+    """
+    _require_windows()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenEventW.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel.OpenEventW.restype = ctypes.c_void_p
+    handle = kernel.OpenEventW(0x0002, False, STOP_EVENT_NAME)  # EVENT_MODIFY_STATE
+    if not handle:
+        return True  # No stop event means no agent has published one.
+    try:
+        if not kernel.SetEvent(ctypes.c_void_p(handle)):
+            raise OSError("Cannot signal background agent to stop")
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if not agent_alive():
+                return True
+            time.sleep(0.2)
+        return not agent_alive()
+    finally:
+        kernel.CloseHandle(ctypes.c_void_p(handle))
+
+
+def set_background_enabled(enabled: bool) -> None:
+    """Explicit global opt-in shared by interval, daily and seasonal rules."""
+    if type(enabled) is not bool:
+        raise ValueError("Background preference must be a boolean")
+    original = load_automation()
+    try:
+        if enabled:
+            install_startup()
+        save_automation(replace(original, background_enabled=enabled))
+        if enabled:
+            start_agent()  # Singleton mutex prevents duplicate running agents.
+        else:
+            uninstall_startup()
+    except Exception:
+        try:
+            save_automation(original)
+            if not original.background_enabled:
+                uninstall_startup()
+        except Exception:
+            pass
+        raise
 
 
 def status_path() -> Path:
@@ -223,16 +396,25 @@ def diagnostic_lines(*, now: float | None = None) -> list[str]:
     config = load_automation()
     lines = [
         f"Background enabled: {config.background_enabled}",
+        f"Automation paused: {config.paused}",
         f"Agent: {agent_health_text(now=moment)}",
         f"Saved interval rules: {len(config.rules)}",
     ]
     for rule in config.rules:
-        due = datetime.fromtimestamp(rule.next_due_utc).astimezone()
+        try:
+            due_text = (
+                f"{datetime.fromtimestamp(rule.next_due_utc).astimezone():%Y-%m-%d %H:%M:%S}"
+            )
+        except (OSError, OverflowError, ValueError):
+            due_text = (
+                f"Unix timestamp {rule.next_due_utc} "
+                "(local date unavailable)"
+            )
         remaining = max(0, int(rule.next_due_utc - moment))
         lines.extend([
             f"- Monitors: {', '.join(rule.monitor_ids)}",
             f"  Enabled: {rule.enabled}; interval: {rule.interval_seconds}s",
-            f"  Next due (local): {due:%Y-%m-%d %H:%M:%S} "
+            f"  Next due (local): {due_text} "
             f"({'due now' if remaining == 0 else f'in {remaining}s'})",
             f"  Last result: {rule.last_result}",
         ])
@@ -283,30 +465,62 @@ def _run_cycle(detector, pending_ids: set[str]) -> str | None:
 
 
 def _apply_due_automations() -> str | None:
-    """Execute due daily and interval rules in one coordinated engine plan."""
+    """Execute daily, interval and seasonal triggers in one coordinated plan."""
+    config = load_automation()
+    # Repair pre-existing overlapping intervals before deciding which are due.
+    # The newest saved enabled timer wins; older overlapping timers are paused.
+    from wallpaper_orchestrator.automation import normalize_interval_conflicts
+    normalized = normalize_interval_conflicts(config)
+    if normalized != config:
+        save_automation(normalized)
+        config = normalized
+    if config.paused:
+        return "Automations paused by user."
     from PySide6.QtCore import QSettings
     from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
     from wallpaper_orchestrator.platforms.windows import discover_monitors
 
     moment = datetime.now().astimezone()
     epoch = time.time()
-    config = load_automation()
     daily = due_rules(load_schedules(), moment)
     intervals = due_intervals(config, epoch)
-    if not daily and not intervals:
-        return None
+    seasons = load_calendar_rules()
+    season_error = None
+    try:
+        previous_seasons = load_seasonal_state()
+    except (OSError, ValueError) as error:
+        previous_seasons = {}
+        season_error = f"Seasonal triggers paused: {error}"
+    if not daily and not intervals and not seasons and not previous_seasons:
+        return season_error
 
     profiles = load_profiles()  # Live order and sources, never cached.
     active = {monitor.device_id for monitor in discover_monitors()}
     if not active:
         return "Waiting for an active Windows display session."
+    season_decision = SeasonDecision(frozenset(), previous_seasons, ())
+    if not season_error:
+        season_decision = evaluate_seasons(
+            seasons, active, moment, epoch=epoch, previous=previous_seasons,
+        )
+        if season_decision.new_states != previous_seasons:
+            try:
+                # Stamp before applying: crashes/restarts must not replay events.
+                save_seasonal_state(season_decision.new_states)
+            except (OSError, ValueError) as error:
+                season_error = f"Seasonal triggers paused: {error}"
+                season_decision = SeasonDecision(frozenset(), previous_seasons, ())
+    if not daily and not intervals and not season_decision.target_ids:
+        return season_error
     daily_targets = resolve_targets(daily, active, profiles)
     interval_targets = resolve_interval_targets(intervals, active, profiles)
-    targets = set(daily_targets.device_ids) | set(interval_targets.device_ids)
+    season_targets = {mid for mid in season_decision.target_ids
+                      if profiles.get(mid, {}).get("mode", "folder") != "fixed"}
+    targets = set(daily_targets.device_ids) | set(interval_targets.device_ids) | season_targets
 
     daily_ids = set(daily_targets.attempted_ids)
     interval_ids = set(interval_targets.attempted_ids)
-    if not daily_ids and not interval_ids:
+    if not daily_ids and not interval_ids and not season_decision.target_ids:
         return "Waiting for a disconnected automation display."
 
     # Mark attempts *before* applying. A crash, reboot, or repeated DST hour
@@ -344,7 +558,7 @@ def _apply_due_automations() -> str | None:
         save_schedules(stamp_attempts(load_schedules(), daily_ids, moment, result))
     if interval_ids:
         save_automation(record_interval_results(load_automation(), interval_ids, result))
-    return result
+    return f"{result} | {season_error}" if season_error else result
 
 
 def main() -> int:
@@ -352,6 +566,7 @@ def main() -> int:
     handle = _single_instance_mutex()
     if handle is None:
         return 0
+    stop_event = _stop_event()
     ole = ctypes.windll.ole32
     initialized = ole.CoInitialize(None) in (0, 1)
     detector = FolderChangeDetector()
@@ -361,6 +576,10 @@ def main() -> int:
         if not initialized:
             raise RuntimeError("Cannot initialize Windows COM for wallpapers")
         while load_automation().background_enabled:
+            if ctypes.windll.kernel32.WaitForSingleObject(
+                    ctypes.c_void_p(stop_event), 0) == 0:
+                last_message = "Background agent stopped for installation or update."
+                break
             try:
                 update = _run_cycle(detector, pending_ids)
                 if update:
@@ -368,7 +587,9 @@ def main() -> int:
             except Exception as error:
                 last_message = f"Background agent will retry: {error}"
             _write_status(last_message)
-            time.sleep(10)
+            if ctypes.windll.kernel32.WaitForSingleObject(
+                    ctypes.c_void_p(stop_event), 10000) == 0:
+                break
         _write_status("Background automation stopped.", running=False)
     except Exception as error:
         try:
@@ -379,6 +600,7 @@ def main() -> int:
     finally:
         if initialized:
             ole.CoUninitialize()
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(stop_event))
         ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
     return 0
 

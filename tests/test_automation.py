@@ -59,13 +59,16 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(config.rules), 1)
         self.assertEqual(config.rules[0].monitor_ids, ("portrait",))
 
-    def test_group_waits_until_every_selected_monitor_is_connected(self):
+    def test_group_continues_for_connected_displays(self):
         config = set_interval(AutomationConfig(), ["p", "l"], 60, now=0)
         targets = resolve_interval_targets(
             list(config.rules), {"p"}, {"p": {"mode": "collections"}}
         )
-        self.assertEqual(targets.device_ids, set())
-        self.assertEqual(targets.deferred_ids, {config.rules[0].id})
+        self.assertEqual(targets.device_ids, {"p"})
+        self.assertEqual(targets.attempted_ids, {config.rules[0].id})
+        self.assertFalse(targets.deferred_ids)
+        returned = resolve_interval_targets(list(config.rules), {"p", "l"}, {})
+        self.assertEqual(returned.device_ids, {"p", "l"})
 
     def test_fixed_member_is_never_shuffled(self):
         config = set_interval(AutomationConfig(), ["p", "l"], 60, now=0)
@@ -80,6 +83,35 @@ class AutomationTests(unittest.TestCase):
         config = set_interval(AutomationConfig(background_enabled=True), ["p"], 180, now=5)
         save_automation(config, self.path)
         self.assertEqual(load_automation(self.path), config)
+
+    def test_global_pause_survives_roundtrip_and_interval_updates(self):
+        config = set_interval(AutomationConfig(background_enabled=True, paused=True),
+                              ["portrait"], 60, now=5)
+        save_automation(config, self.path)
+        self.assertTrue(load_automation(self.path).paused)
+        self.assertEqual(load_automation(self.path).rules, config.rules)
+        changed = set_interval(load_automation(self.path), ["landscape"], 120, now=5)
+        self.assertTrue(changed.paused)
+
+    def test_legacy_automation_file_defaults_to_not_paused(self):
+        self.path.write_text('{"version": 1, "background_enabled": true, "rules": []}',
+                             encoding="utf-8")
+        self.assertFalse(load_automation(self.path).paused)
+
+    def test_pause_prevents_due_checks_without_qt_and_keeps_intervals(self):
+        config = set_interval(AutomationConfig(background_enabled=True, paused=True),
+                              ["portrait"], 60, now=5)
+        with patch.object(background, "load_automation", return_value=config):
+            self.assertEqual(background._apply_due_automations(),
+                             "Automations paused by user.")
+        self.assertEqual(config.rules[0].next_due_utc, 65)
+
+    def test_invalid_pause_setting_preserves_file(self):
+        invalid = '{"version": 1, "background_enabled": true, "rules": [], "paused": 1}'
+        self.path.write_text(invalid, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "pause setting"):
+            save_automation(AutomationConfig(), self.path)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), invalid)
 
     def test_manual_result_does_not_move_next_due(self):
         config = set_interval(AutomationConfig(), ["p"], 90, now=50)

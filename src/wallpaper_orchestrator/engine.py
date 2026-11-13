@@ -2,13 +2,21 @@
 
 from collections import Counter
 from collections.abc import Collection
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 import random
 import re
+import sqlite3
+import warnings
 
 from wallpaper_orchestrator.config import load_config
 from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.calendar_rules import (
+    CalendarRule, active_calendar_rule, load_calendar_rules,
+)
+from wallpaper_orchestrator.intelligence import SelectionPolicy, load_selection_policy
+from wallpaper_orchestrator.recent_history import RecentHistory
 from wallpaper_orchestrator.library import load_wallpapers
 from wallpaper_orchestrator.models import Monitor, Wallpaper
 from wallpaper_orchestrator.selector import choose_for_monitors
@@ -162,14 +170,31 @@ def _catalog_wallpapers(catalog: WallpaperCatalog):
     return by_image_id, by_collection
 
 
+def _catalog_memberships(catalog: WallpaperCatalog) -> dict[str, tuple[set[str], set[str]]]:
+    """Stable tag/collection IDs keyed by image path, including smart collections."""
+    result = {}
+    for collection in catalog.list_collections():
+        for image in catalog.list_collection_images(collection.id):
+            key = _path_key(image.path)
+            if key not in result:
+                result[key] = ({tag.id for tag in catalog.list_image_tags(image.id)}, set())
+            result[key][1].add(collection.id)
+    return result
+
+
+def _rule_match(rule, membership: tuple[set[str], set[str]]) -> bool:
+    return rule.matches(*membership)
+
+
 def _selection_failure_message(
-    targets, candidate_sets, used_images, limits, counts, theme_owners
+    targets, candidate_sets, used_images, limits, counts, theme_owners,
+    *, avoid_duplicates: bool = True,
 ) -> str:
     """Explain a proven blocker without guessing at the user's configuration."""
     unused = {
         m.device_id: [
             image for image in candidate_sets[m.device_id]
-            if _path_key(image.path) not in used_images
+            if not avoid_duplicates or _path_key(image.path) not in used_images
         ]
         for m in targets
     }
@@ -207,7 +232,7 @@ def _selection_failure_message(
         _path_key(image.path)
         for choices in unused.values() for image in choices
     }
-    if len(unique_images) < len(targets):
+    if avoid_duplicates and len(unique_images) < len(targets):
         return (
             f"Only {len(unique_images)} distinct matching wallpaper(s) "
             f"are available for {len(targets)} selected displays. Each "
@@ -234,11 +259,20 @@ def create_profile_plan(
     selected_device_id: str | None = None,
     selected_device_ids: Collection[str] | None = None,
     respect_theme_limits: bool = True,
+    calendar_rules: list[CalendarRule] | None = None,
+    calendar_now: datetime | None = None,
+    selection_policy: SelectionPolicy | None = None,
+    recent_by_monitor: Mapping[str, tuple[str, ...]] | None = None,
 ):
     """Plan a shuffle while preserving all monitors that are not targeted.
 
     A fixed monitor is never a shuffle target. Non-target monitors contribute
     their *current* wallpaper tags to theme limits, when metadata is known.
+
+    C4 calendar rules can *filter* an eligible monitor's existing source, but
+    never expand its collection subscriptions or move a file. A preferred
+    filter falls back if no image matches; a required filter explains why
+    the update cannot proceed. A fixed monitor is still never shuffled.
 
     Returned keys are device IDs, so a friendly-name change does not affect
     selections. This is separate from the legacy CLI's role-keyed `create_plan`.
@@ -305,6 +339,7 @@ def create_profile_plan(
     # and image orientation always determine basic eligibility; a legacy
     # config.json rule must never imply a portrait-only collection.
     limits = _theme_limits() if respect_theme_limits else {}
+    policy = selection_policy if selection_policy is not None else load_selection_policy()
 
     # Folder-mode targets still use the legacy filesystem reader. Collection
     # targets use SQLite and should not rescan the unrelated main library (or
@@ -361,6 +396,24 @@ def create_profile_plan(
                 collection_candidates[device_id] = list(options.values())
                 collection_source_details[device_id] = details
 
+    # C5 metadata is authoritative in SQLite, indexed by stable tag and
+    # collection IDs. Folder-mode images absent from SQLite have empty
+    # metadata; Require filters never silently accept them.
+    with WallpaperCatalog() as catalog:
+        memberships = _catalog_memberships(catalog)
+
+    if recent_by_monitor is None and policy.recent_window:
+        with RecentHistory() as history:
+            if policy.recent_scope == "all":
+                global_recent = history.recent_global_events(policy.recent_window)
+                recent_by_monitor = {m.device_id: global_recent for m in targets}
+            else:
+                recent_by_monitor = {
+                    m.device_id: history.recent(m.device_id, policy.recent_window)
+                    for m in targets
+                }
+    recent_by_monitor = recent_by_monitor or {}
+
     # Pinned, fixed, or excluded monitors still consume theme capacity.
     counts: Counter[str] = Counter()
     used_images = set()
@@ -399,6 +452,47 @@ def create_profile_plan(
                 "Change an existing wallpaper or turn off Cross-monitor limits."
             )
 
+    # Current wallpapers on unchanged displays consume C5 capacity too.
+    c5_counts: Counter[tuple[str, str]] = Counter()
+    group_counts: dict[str, Counter[tuple[str, str]]] = {
+        group.id: Counter() for group in policy.groups
+    }
+    def image_keys(path: Path) -> set[tuple[str, str]]:
+        tags, collections = memberships.get(_path_key(path), (set(), set()))
+        return {("tag", tid) for tid in tags} | {("collection", cid) for cid in collections}
+
+    for monitor in detected:
+        if monitor.device_id in target_ids:
+            continue
+        current = get_monitor_wallpaper(monitor.device_id)
+        if not current:
+            continue
+        key = _path_key(Path(current))
+        if (policy.collection_limits or policy.tag_limits or
+                any(g.collection_limits or g.tag_limits for g in policy.groups)) and key not in memberships:
+            raise ValueError(
+                "Cannot enforce intelligent theme limits: an unchanged display "
+                "uses an image missing from the indexed catalogue. Scan its folder first."
+            )
+        keys = image_keys(Path(current))
+        c5_counts.update(keys)
+        for group in policy.groups:
+            if monitor.device_id in group.monitor_ids:
+                group_counts[group.id].update(keys)
+
+    def over_limit(keys: set[tuple[str, str]], monitor_id: str) -> bool:
+        for kind, identity in keys:
+            limits_for_kind = (policy.tag_limits if kind == "tag" else policy.collection_limits)
+            if identity in limits_for_kind and c5_counts[(kind, identity)] >= limits_for_kind[identity]:
+                return True
+            for group in policy.groups:
+                if monitor_id not in group.monitor_ids:
+                    continue
+                group_caps = group.tag_limits if kind == "tag" else group.collection_limits
+                if identity in group_caps and group_counts[group.id][(kind, identity)] >= group_caps[identity]:
+                    return True
+        return False
+
     candidate_sets = {}
     for m in targets:
         collection_mode = m.device_id in collection_targets
@@ -428,41 +522,199 @@ def create_profile_plan(
             m.device_id,
         )
 
+    # Calendar policies are passive selectors. Every existing trigger (the
+    # button, a daily schedule, or the headless interval agent) consults the
+    # current policy; no scheduler needs its own image-selection algorithm.
+    calendar = load_calendar_rules() if calendar_rules is None else calendar_rules
+    moment = calendar_now or datetime.now().astimezone()
+    active_policies = {
+        m.device_id: rule for m in targets
+        if (rule := active_calendar_rule(calendar, moment, m.device_id)) is not None
+    }
+    if active_policies:
+        with WallpaperCatalog() as catalog:
+            images_by_path = {}
+            tag_ids_by_image = {}
+            collection_ids_by_image = {}
+            for monitor in targets:
+                rule = active_policies.get(monitor.device_id)
+                if rule is None:
+                    continue
+                matching = []
+                for wallpaper in candidate_sets[monitor.device_id]:
+                    path_key = _path_key(wallpaper.path)
+                    hard_rules = [r for r in policy.rules_for(monitor.device_id)
+                                  if r.mode == "require"]
+                    if not all(_rule_match(r, memberships.get(path_key, (set(), set())))
+                               for r in hard_rules):
+                        continue
+                    if path_key not in images_by_path:
+                        images_by_path[path_key] = catalog.find_image_by_path(wallpaper.path)
+                    image = images_by_path[path_key]
+                    # Non-indexed folder images have no database tags or
+                    # collections. A preferred rule will fall back below.
+                    if image is None:
+                        continue
+                    if image.id not in tag_ids_by_image:
+                        tag_ids_by_image[image.id] = {
+                            tag.id for tag in catalog.list_image_tags(image.id)
+                        }
+                    tags = tag_ids_by_image[image.id]
+                    if rule.include_tag_ids and not tags.intersection(rule.include_tag_ids):
+                        continue  # Any listed included tag may match.
+                    if rule.exclude_tag_ids and tags.intersection(rule.exclude_tag_ids):
+                        continue
+                    if rule.collection_ids:
+                        if image.id not in collection_ids_by_image:
+                            collection_ids_by_image[image.id] = {
+                                item.id for item in catalog.list_image_collections(image.id)
+                            }
+                        if not collection_ids_by_image[image.id].intersection(rule.collection_ids):
+                            continue
+                    matching.append(wallpaper)
+                if matching:
+                    source = sources.get(monitor.device_id)
+                    candidate_sets[monitor.device_id] = _order_candidates(
+                        matching, source, profiles.get(monitor.device_id, {}),
+                        monitor.device_id,
+                    )
+                elif rule.behavior == "require":
+                    raise ValueError(
+                        f"Seasonal rule '{rule.name}' has no matching "
+                        f"{monitor.orientation} wallpapers for this display. "
+                        "Add and scan a tagged image in its assigned source, "
+                        "change the rule's filters, or set it to Prefer."
+                    )
+
+    # C5 rules operate only within the monitor's already-eligible sources.
+    # Require rules filter; Prefer rules affect ordering but never invalidate
+    # an otherwise possible combination.
+    for monitor in targets:
+        mid = monitor.device_id
+        hard_rules = [rule for rule in policy.rules_for(mid) if rule.mode == "require"]
+        preferred = [rule for rule in policy.rules_for(mid) if rule.mode == "prefer"]
+        candidates = [wallpaper for wallpaper in candidate_sets[mid]
+                      if all(_rule_match(rule, memberships.get(_path_key(wallpaper.path),
+                                                         (set(), set()))) for rule in hard_rules)]
+        if not candidates:
+            raise ValueError(
+                f"Intelligent Require filters leave no {monitor.orientation} "
+                f"wallpapers for this display. Check its tags and subscribed collections."
+            )
+        recent = set(recent_by_monitor.get(mid, ())[
+            :policy.recent_window if policy.recent_scope == "monitor" else None
+        ]) if policy.recent_window else set()
+        if policy.recent_mode == "require":
+            candidates = [item for item in candidates if _path_key(item.path) not in recent]
+            if not candidates:
+                raise ValueError(
+                    f"No wallpapers remain outside the last {policy.recent_window} "
+                    "choices. Reduce the recent-image window or choose Prefer."
+                )
+        def preference_score(wallpaper):
+            membership = memberships.get(_path_key(wallpaper.path), (set(), set()))
+            return (
+                int(_path_key(wallpaper.path) not in recent),
+                sum(_rule_match(rule, membership) for rule in preferred),
+            )
+        # Stable sorting retains Random / Next / Previous within each tier.
+        candidates.sort(key=preference_score, reverse=True)
+        candidate_sets[mid] = candidates
+
     # Check more constrained monitors first, then backtrack if needed.
     targets.sort(key=lambda m: len(candidate_sets[m.device_id]))
     assignments = {}
 
-    def search(index: int) -> bool:
-        if index == len(targets):
+    # A greedy first-valid combination can waste a fresh image on a monitor
+    # that has alternatives, forcing a second monitor into its recent history.
+    # Search for the best *joint* preference score, with a bounded improvement
+    # pass once a valid plan exists. Never bound the initial feasibility search.
+    optimize = any(
+        rule.mode == "prefer" for m in targets for rule in policy.rules_for(m.device_id)
+    ) or (policy.recent_mode == "prefer" and any(
+        recent_by_monitor.get(m.device_id) for m in targets
+    ))
+    scores = {}
+    for m in targets:
+        mid = m.device_id
+        recent = set(recent_by_monitor.get(mid, ())[
+            :policy.recent_window if policy.recent_scope == "monitor" else None
+        ]) if policy.recent_window else set()
+        preferred = [rule for rule in policy.rules_for(mid) if rule.mode == "prefer"]
+        for item in candidate_sets[mid]:
+            key = _path_key(item.path)
+            meta = memberships.get(key, (set(), set()))
+            scores[(mid, key)] = (
+                (1000 if key not in recent else 0) if policy.recent_window else 0
+            ) + sum(rule.matches(*meta) for rule in preferred)
+
+    best: dict = {}
+    best_score = -1
+    visited = 0
+    budget = 20000
+
+    def search(index: int, score: int = 0) -> bool:
+        nonlocal best, best_score, visited
+        if best and (not optimize or visited >= budget):
             return True
+        if index == len(targets):
+            if score > best_score:
+                best = dict(assignments)
+                best_score = score
+            return not optimize
         m = targets[index]
         for w in candidate_sets[m.device_id]:
+            visited += 1
             key = _path_key(w.path)
-            if key in used_images:
+            if policy.avoid_duplicates and key in used_images:
                 continue
             if any(counts[theme] >= limits[theme]
                    for theme in w.themes if theme in limits):
                 continue
+            keys = image_keys(w.path)
+            if over_limit(keys, m.device_id):
+                continue
             assignments[m.device_id] = w
+            newly_used = key not in used_images
             used_images.add(key)
             counts.update(w.themes)
-            if search(index + 1):
-                return True
+            c5_counts.update(keys)
+            member_groups = [g.id for g in policy.groups if m.device_id in g.monitor_ids]
+            for group_id in member_groups:
+                group_counts[group_id].update(keys)
+            done = search(index + 1, score + scores[(m.device_id, key)])
             del assignments[m.device_id]
-            used_images.remove(key)
+            if newly_used:
+                used_images.remove(key)
             for theme in w.themes:
                 counts[theme] -= 1
+            for item in keys:
+                c5_counts[item] -= 1
+                for group_id in member_groups:
+                    group_counts[group_id][item] -= 1
+            if done:
+                return True
         return False
 
-    if not search(0):
+    search(0)
+    if not best:
+        if policy.collection_limits or policy.tag_limits or any(
+            g.collection_limits or g.tag_limits for g in policy.groups
+        ):
+            raise ValueError(
+                "No combination satisfies the configured C5 collection/tag "
+                "limits and available wallpapers. Relax a strict limit, add "
+                "more images, or update the affected monitors together."
+            )
         raise ValueError(
             _selection_failure_message(
-                targets, candidate_sets, used_images, limits, counts, theme_owners
+                targets, candidate_sets, used_images, limits, counts, theme_owners,
+                avoid_duplicates=policy.avoid_duplicates,
             )
         )
 
     # `apply_plan` accepts any assignment key paired with its device ID.
-    return assignments, {device_id: device_id for device_id in assignments}
+    return best, {device_id: device_id for device_id in best}
 
 
 def apply_plan(assignments, device_ids):
@@ -496,3 +748,12 @@ def apply_plan(assignments, device_ids):
         raise RuntimeError(
             f"Wallpaper application failed: {error}. {details}"
         ) from error
+    # Keep history after the entire coordinated update succeeded, never after
+    # a partial application or attempted rollback. A history I/O failure must
+    # not be reported as a wallpaper-application failure.
+    try:
+        with RecentHistory() as history:
+            history.record({device_ids[key]: wallpaper.path
+                            for key, wallpaper in assignments.items()})
+    except (OSError, ValueError, sqlite3.Error) as error:
+        warnings.warn(f"Wallpapers applied, but recent history was not saved: {error}")

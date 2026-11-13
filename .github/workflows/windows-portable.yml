@@ -1,0 +1,50 @@
+name: C8 Windows portable build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/c8-*'
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Build portable application
+        shell: pwsh
+        run: ./scripts/build_windows.ps1
+
+      - name: Check bundled imports without accessing user configuration
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'dist\WallpaperOrchestrator\WallpaperOrchestrator.exe'
+          $result = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
+          if ($result.ExitCode -ne 0) {
+            throw "Portable executable smoke test failed with code $($result.ExitCode)."
+          }
+
+      - name: Create download ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'dist\WallpaperOrchestrator' -DestinationPath 'dist\WallpaperOrchestrator-C8.1-Windows.zip'
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperOrchestrator-C8.1-Windows
+          path: dist/WallpaperOrchestrator-C8.1-Windows.zip
+          if-no-files-found: error
+          retention-days: 30

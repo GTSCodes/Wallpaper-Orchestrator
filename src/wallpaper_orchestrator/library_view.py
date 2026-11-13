@@ -5,6 +5,7 @@ uses the B1/B2 catalogue API, so the original image files remain untouched.
 B4 watches linked folders for automatic background indexing.
 """
 
+from collections import deque
 import threading
 import time
 import warnings
@@ -12,27 +13,32 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import (
-    QObject, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot,
+    QItemSelectionModel, QObject, QSize, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot,
 )
-from PySide6.QtGui import QDesktopServices, QImageReader, QPixmap
+from PySide6.QtGui import QDesktopServices, QIcon, QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +46,11 @@ from PySide6.QtWidgets import (
 from wallpaper_orchestrator.catalog import WallpaperCatalog
 from wallpaper_orchestrator.indexer import resolve_folder_link, scan_all, scan_folder
 from wallpaper_orchestrator.watcher import FolderChangeDetector
+from wallpaper_orchestrator.library_c6_view import (
+    DuplicateScanWorker, FolderDefaultsDialog, ImageDropGrid, ImageDropTable, ImportWorker,
+    SmartCollectionsDialog, TagFilterDialog,
+)
+from wallpaper_orchestrator.indexer import SUPPORTED_EXTENSIONS
 
 
 USER_ROLE = Qt.ItemDataRole.UserRole
@@ -92,6 +103,20 @@ class LibraryPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._image_records = []
+        self._tag_ids_by_image: dict[str, set[str]] = {}
+        self._available_tags = []
+        self._filter_included: set[str] = set()
+        self._filter_excluded: set[str] = set()
+        self._filter_all = False
+        self._thumb_pending = deque()
+        self._grid_items = {}
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.timeout.connect(self._load_thumbnail_batch)
+        self._duplicates_thread: QThread | None = None
+        self._duplicates_worker: DuplicateScanWorker | None = None
+        self._import_thread: QThread | None = None
+        self._import_worker: ImportWorker | None = None
+        self._import_folder_id: str | None = None
         self._scan_thread: QThread | None = None
         self._scan_worker: ScanWorker | None = None
         self._scan_automatic = False
@@ -202,9 +227,28 @@ class LibraryPanel(QWidget):
         self.orientation_filter.currentIndexChanged.connect(self._filter_images)
         search_row.addWidget(self.search, 1)
         search_row.addWidget(self.orientation_filter)
+        self.tag_filter_button = QPushButton("Tags…")
+        self.tag_filter_button.setToolTip("Include or exclude multiple tags in this view")
+        search_row.addWidget(self.tag_filter_button)
+        self.view_mode = QComboBox()
+        self.view_mode.addItem("Table", "table")
+        self.view_mode.addItem("Thumbnails", "grid")
+        self.view_mode.setToolTip("Switch between a detailed table and image thumbnails")
+        search_row.addWidget(self.view_mode)
+        self.tools_button = QToolButton()
+        self.tools_button.setText("Library tools ▾")
+        self.tools_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.tools_menu = QMenu(self.tools_button)
+        self.import_action = self.tools_menu.addAction("Import images…")
+        self.folder_defaults_action = self.tools_menu.addAction("Default tags for linked folder…")
+        self.smart_action = self.tools_menu.addAction("Manage smart collections…")
+        self.tools_menu.addSeparator()
+        self.duplicates_action = self.tools_menu.addAction("Find exact duplicates…")
+        self.tools_button.setMenu(self.tools_menu)
+        search_row.addWidget(self.tools_button)
         right_layout.addLayout(search_row)
 
-        self.images = QTableWidget(0, 4)
+        self.images = ImageDropTable(0, 4)
         self.images.setObjectName("libraryImages")
         self.images.setHorizontalHeaderLabels(
             ["Image", "Dimensions", "Orientation", "Status"]
@@ -213,7 +257,7 @@ class LibraryPanel(QWidget):
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         self.images.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self.images.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
@@ -229,7 +273,25 @@ class LibraryPanel(QWidget):
                 index, QHeaderView.ResizeMode.ResizeToContents
             )
         self.images.itemSelectionChanged.connect(self._image_changed)
-        right_layout.addWidget(self.images, 3)
+        self.grid = ImageDropGrid()
+        self.grid.setViewMode(QListView.ViewMode.IconMode)
+        self.grid.setResizeMode(QListView.ResizeMode.Adjust)
+        self.grid.setMovement(QListView.Movement.Static)
+        self.grid.setWrapping(True)
+        self.grid.setIconSize(QSize(135, 105))
+        self.grid.setGridSize(QSize(164, 158))
+        self.grid.setSpacing(8)
+        self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # Re-assert drop-only *after* setting icon mode; some Qt styles change
+        # the list view's drag/drop policy as part of the view-mode switch.
+        self.grid.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.grid.setAcceptDrops(True)
+        self.grid.viewport().setAcceptDrops(True)
+        self.grid.itemSelectionChanged.connect(self._image_changed)
+        self.image_views = QStackedWidget()
+        self.image_views.addWidget(self.images)
+        self.image_views.addWidget(self.grid)
+        right_layout.addWidget(self.image_views, 3)
 
         details = QHBoxLayout()
         details.setSpacing(12)
@@ -317,6 +379,19 @@ class LibraryPanel(QWidget):
         self.delete_tag_button.clicked.connect(self._delete_tag)
         self.image_tags.currentItemChanged.connect(self._sync_buttons)
         self.tag_choice.currentIndexChanged.connect(self._sync_buttons)
+        self.tag_filter_button.clicked.connect(self._choose_tag_filters)
+        self.view_mode.currentIndexChanged.connect(self._switch_view)
+        self.import_action.triggered.connect(self._choose_import_images)
+        self.folder_defaults_action.triggered.connect(self._configure_folder_defaults)
+        self.smart_action.triggered.connect(self._open_smart_collections)
+        self.duplicates_action.triggered.connect(self._find_duplicates)
+        self.images.files_dropped.connect(self._import_dropped_images)
+        self.grid.files_dropped.connect(self._import_dropped_images)
+        for view in (self.images, self.grid):
+            view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            view.customContextMenuRequested.connect(
+                lambda pos, widget=view: self._image_context_menu(widget, pos)
+            )
 
         self.refresh_collections()
         if self.auto_scan_checkbox.isChecked():
@@ -341,11 +416,18 @@ class LibraryPanel(QWidget):
         return item.data(USER_ROLE) if item else None
 
     def selected_image_id(self) -> str | None:
-        selected = self.images.selectionModel().selectedRows()
-        if not selected:
-            return None
-        cell = self.images.item(selected[0].row(), 0)
-        return cell.data(USER_ROLE) if cell else None
+        identities = self.selected_image_ids()
+        return identities[0] if identities else None
+
+    def selected_image_ids(self) -> tuple[str, ...]:
+        if self.image_views.currentWidget() is self.grid:
+            return tuple(item.data(USER_ROLE) for item in self.grid.selectedItems())
+        result = []
+        for model_index in self.images.selectionModel().selectedRows():
+            cell = self.images.item(model_index.row(), 0)
+            if cell:
+                result.append(cell.data(USER_ROLE))
+        return tuple(result)
 
     def _error(self, message: str) -> None:
         QMessageBox.critical(self, "Library Error", message)
@@ -360,6 +442,7 @@ class LibraryPanel(QWidget):
             self._error(str(error))
             return
         self.collections.blockSignals(True)
+        self._available_tags = tags
         self.collections.clear()
         row_to_select = 0
         for row, collection in enumerate(collections):
@@ -385,18 +468,28 @@ class LibraryPanel(QWidget):
 
     def _collection_changed(self, *_args) -> None:
         collection_id = self.selected_collection_id()
-        previous_image_id = self.selected_image_id()
+        previous_image_ids = self.selected_image_ids()
         self.folders.clear()
         self._image_records = []
+        self._tag_ids_by_image = {}
+        self._thumb_timer.stop()
+        self._thumb_pending.clear()
         self.images.blockSignals(True)
         self.images.setRowCount(0)
         self.images.blockSignals(False)
+        self.grid.blockSignals(True)
+        self.grid.clear()
+        self._grid_items.clear()
+        self.grid.blockSignals(False)
         self.collection_summary.setText("Select a collection")
         if collection_id:
             try:
                 with WallpaperCatalog() as catalog:
                     links = catalog.list_folder_links(collection_id)
                     self._image_records = catalog.list_collection_images(collection_id)
+                    self._tag_ids_by_image = catalog.list_image_tag_ids(
+                        record.id for record in self._image_records
+                    )
                 for folder in links:
                     item = QListWidgetItem(str(folder.path))
                     item.setData(USER_ROLE, folder.id)
@@ -408,10 +501,8 @@ class LibraryPanel(QWidget):
                     f"{len(self._image_records)} indexed image(s)"
                 )
                 self._populate_images()
-                for row, image in enumerate(self._image_records):
-                    if image.id == previous_image_id and not self.images.isRowHidden(row):
-                        self.images.selectRow(row)
-                        break
+                if previous_image_ids:
+                    self._select_images(previous_image_ids)
             except Exception as error:
                 self._error(str(error))
         self._image_changed()
@@ -441,7 +532,96 @@ class LibraryPanel(QWidget):
         finally:
             self.images.setUpdatesEnabled(True)
             self.images.blockSignals(False)
+        self.grid.blockSignals(True)
+        self.grid.setUpdatesEnabled(False)
+        try:
+            self.grid.clear()
+            self._thumb_pending = deque()
+            self._grid_items = {}
+            for record in self._image_records:
+                item = QListWidgetItem(record.path.name)
+                item.setData(USER_ROLE, record.id)
+                item.setToolTip(str(record.path))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+                self.grid.addItem(item)
+                self._grid_items[record.id] = item
+                if record.available and record.path.is_file() and record.width * record.height <= MAX_PREVIEW_PIXELS:
+                    self._thumb_pending.append((record.id, record.path, record.width, record.height))
+        finally:
+            self.grid.setUpdatesEnabled(True)
+            self.grid.blockSignals(False)
         self._filter_images()
+        if self.image_views.currentWidget() is self.grid:
+            self._thumb_timer.start(30)
+
+    def _load_thumbnail_batch(self):
+        if self.image_views.currentWidget() is not self.grid:
+            self._thumb_timer.stop()
+            return
+        for _ in range(min(5, len(self._thumb_pending))):
+            image_id, path, width, height = self._thumb_pending.popleft()
+            item = self._grid_items.get(image_id)
+            if item is None or item.isHidden():
+                continue
+            reader = QImageReader(str(path))
+            reader.setAutoTransform(True)
+            scale = min(132 / width, 104 / height, 1.0)
+            reader.setScaledSize(QSize(max(1, int(width * scale)),
+                                       max(1, int(height * scale))))
+            image = reader.read()
+            if not image.isNull():
+                item.setIcon(QIcon(QPixmap.fromImage(image)))
+        if not self._thumb_pending:
+            self._thumb_timer.stop()
+
+    def _select_images(self, identities):
+        chosen = set(identities)
+        self.images.blockSignals(True)
+        self.grid.blockSignals(True)
+        self.images.clearSelection()
+        self.grid.clearSelection()
+        for row, record in enumerate(self._image_records):
+            if record.id not in chosen or self.images.isRowHidden(row):
+                continue
+            index = self.images.model().index(row, 0)
+            self.images.selectionModel().select(index,
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+            item = self._grid_items.get(record.id)
+            if item and not item.isHidden():
+                item.setSelected(True)
+        self.images.blockSignals(False)
+        self.grid.blockSignals(False)
+        self._image_changed()
+
+    def _switch_view(self, *_args):
+        chosen = self.selected_image_ids()
+        new_index = 1 if self.view_mode.currentData() == "grid" else 0
+        self.image_views.setCurrentIndex(new_index)
+        self._select_images(chosen)
+        if new_index == 1:
+            self._queue_visible_thumbnails()
+
+    def _queue_visible_thumbnails(self):
+        pending_ids = {mid for mid, *_ in self._thumb_pending}
+        for record in self._image_records:
+            item = self._grid_items.get(record.id)
+            if (item and not item.isHidden() and item.icon().isNull()
+                    and record.id not in pending_ids and record.available
+                    and record.path.is_file() and record.width * record.height <= MAX_PREVIEW_PIXELS):
+                self._thumb_pending.append((record.id, record.path, record.width, record.height))
+        if self._thumb_pending:
+            self._thumb_timer.start(30)
+
+    def _choose_tag_filters(self):
+        dialog = TagFilterDialog(self._available_tags, self._filter_included,
+                                 self._filter_excluded, self._filter_all, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._filter_included, self._filter_excluded, self._filter_all = dialog.selection()
+            count = len(self._filter_included) + len(self._filter_excluded)
+            self.tag_filter_button.setText(f"Tags ({count})…" if count else "Tags…")
+            self._filter_images()
+            if self.image_views.currentWidget() is self.grid:
+                self._queue_visible_thumbnails()
 
     def _filter_images(self, *_args) -> None:
         query = self.search.text().casefold().strip()
@@ -449,14 +629,37 @@ class LibraryPanel(QWidget):
         for row, image in enumerate(self._image_records):
             show = (query in image.path.name.casefold()
                     and (orientation == "all" or image.orientation == orientation))
+            tags = self._tag_ids_by_image.get(image.id, set())
+            if self._filter_included:
+                show = show and (self._filter_included.issubset(tags) if self._filter_all
+                                 else bool(self._filter_included & tags))
+            show = show and not bool(self._filter_excluded & tags)
             self.images.setRowHidden(row, not show)
+            if row < self.grid.count():
+                self.grid.item(row).setHidden(not show)
         if not self.selected_image_id():
             self._image_changed()
 
     def _image_changed(self) -> None:
-        image_id = self.selected_image_id()
+        image_ids = self.selected_image_ids()
+        image_id = image_ids[0] if image_ids else None
         self.image_tags.clear()
         self.preview.clear()
+        if len(image_ids) > 1:
+            common = set.intersection(*(self._tag_ids_by_image.get(mid, set())
+                                        for mid in image_ids))
+            self.preview.setText(f"{len(image_ids)} images selected")
+            self.image_info.setText(
+                f"{len(image_ids)} images selected. Assign tags to all of them; "
+                "only tags shared by every selected image are shown below."
+            )
+            for tag in self._available_tags:
+                if tag.id in common:
+                    item = QListWidgetItem(tag.name)
+                    item.setData(USER_ROLE, tag.id)
+                    self.image_tags.addItem(item)
+            self._sync_buttons()
+            return
         image = next((record for record in self._image_records
                       if record.id == image_id), None)
         if image is None:
@@ -468,14 +671,11 @@ class LibraryPanel(QWidget):
             f"{image.path.name}\n{image.width} × {image.height} · "
             f"{image.orientation.title()} · {image.size_bytes / 1048576:.1f} MB"
         )
-        try:
-            with WallpaperCatalog() as catalog:
-                for tag in catalog.list_image_tags(image.id):
-                    item = QListWidgetItem(tag.name)
-                    item.setData(USER_ROLE, tag.id)
-                    self.image_tags.addItem(item)
-        except Exception as error:
-            self.status.setText(str(error))
+        for tag in self._available_tags:
+            if tag.id in self._tag_ids_by_image.get(image.id, set()):
+                item = QListWidgetItem(tag.name)
+                item.setData(USER_ROLE, tag.id)
+                self.image_tags.addItem(item)
         if not image.available or not image.path.is_file():
             self.preview.setText("Image unavailable")
         elif image.width * image.height > MAX_PREVIEW_PIXELS:
@@ -502,9 +702,10 @@ class LibraryPanel(QWidget):
     def _sync_buttons(self, *_args) -> None:
         has_collection = self.selected_collection_id() is not None
         has_folder = self.selected_folder_id() is not None
-        has_image = self.selected_image_id() is not None
+        image_count = len(self.selected_image_ids())
+        has_image = image_count > 0
         has_tag = self.tag_choice.currentData() is not None
-        busy = self.scan_running()
+        busy = self.scan_running() or self._import_thread is not None
         for button in (self.rename_collection_button, self.delete_collection_button,
                        self.add_folder_button):
             button.setEnabled(has_collection and not busy)
@@ -521,6 +722,11 @@ class LibraryPanel(QWidget):
         self.new_tag_button.setEnabled(not busy)
         self.rename_tag_button.setEnabled(has_tag and not busy)
         self.delete_tag_button.setEnabled(has_tag and not busy)
+        self.add_tag_button.setText("Assign to all" if image_count > 1 else "Assign")
+        self.remove_tag_button.setText("Remove from all" if image_count > 1 else "Remove")
+        self.folder_defaults_action.setEnabled(has_folder and not busy)
+        self.duplicates_action.setEnabled(self._duplicates_thread is None)
+        self.import_action.setEnabled(not busy)
 
     def _add_collection(self) -> None:
         name, accepted = QInputDialog.getText(self, "New Collection", "Name:")
@@ -642,24 +848,269 @@ class LibraryPanel(QWidget):
         except Exception as error:
             self._error(str(error))
 
-    def _assign_tag(self) -> None:
-        image_id, tag_id = self.selected_image_id(), self.tag_choice.currentData()
-        if not image_id or not tag_id:
+    def _configure_folder_defaults(self):
+        folder_id = self.selected_folder_id()
+        if not folder_id:
+            QMessageBox.information(self, "Default Tags", "Select a linked folder on the left first.")
             return
         try:
             with WallpaperCatalog() as catalog:
-                catalog.tag_image(image_id, tag_id)
+                link = catalog.get_folder_link(folder_id)
+                selected = [tag.id for tag in catalog.list_folder_default_tags(folder_id)]
+            editor = FolderDefaultsDialog(link.path.name, self._available_tags, selected, self)
+            if editor.exec() != QDialog.DialogCode.Accepted:
+                return
+            with WallpaperCatalog() as catalog:
+                catalog.set_folder_default_tags(folder_id, editor.selected_ids())
+            self._collection_changed()
+            self.status.setText("Folder default tags saved and applied to existing indexed images. "
+                                "Future imports and auto-scans also receive these tags.")
+        except (OSError, ValueError, KeyError) as error:
+            self._error(str(error))
+
+    def _open_smart_collections(self):
+        try:
+            SmartCollectionsDialog(self).exec()
+            self.refresh_collections()
+        except (OSError, ValueError) as error:
+            self._error(str(error))
+
+    def _choose_import_images(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import wallpaper images", str(Path.home()),
+            "Wallpaper images (*.jpg *.jpeg *.png *.bmp *.webp)",
+        )
+        if paths:
+            self._import_dropped_images(tuple(Path(path) for path in paths))
+
+    def _import_dropped_images(self, paths):
+        if self._import_thread is not None or self.scan_running():
+            self.status.setText("Please wait for the current Library operation to finish.")
+            return
+        collection_id = self.selected_collection_id()
+        if not collection_id:
+            QMessageBox.information(self, "Import Images", "Select a collection first.")
+            return
+        incoming = tuple(Path(path) for path in paths
+                         if Path(path).suffix.lower() in SUPPORTED_EXTENSIONS)
+        if not incoming:
+            QMessageBox.warning(self, "Import Images", "No supported wallpaper images selected.")
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                links = [link for link in catalog.list_folder_links(collection_id)
+                         if link.path.is_dir()]
+        except (OSError, ValueError) as error:
+            self._error(str(error))
+            return
+        if not links:
+            QMessageBox.information(
+                self, "Import Images", "This collection has no available linked folder. "
+                "Use + Folder to link an existing destination first.",
+            )
+            return
+        chosen = next((link for link in links if link.id == self.selected_folder_id()), None)
+        if chosen is None and len(links) > 1:
+            choices = [str(link.path) for link in links]
+            name, accepted = QInputDialog.getItem(
+                self, "Import destination", "Copy images into:", choices, 0, False,
+            )
+            if not accepted:
+                return
+            chosen = links[choices.index(name)]
+        chosen = chosen or links[0]
+        if QMessageBox.question(
+            self, "Import Wallpapers",
+            f"Copy {len(incoming)} image(s) to:\n{chosen.path}\n\n"
+            "Original files will remain where they are. Existing files will not be overwritten.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._import_folder_id = chosen.id
+        self._import_thread = QThread(self)
+        self._import_worker = ImportWorker(incoming, chosen.path)
+        self._import_worker.moveToThread(self._import_thread)
+        self._import_thread.started.connect(self._import_worker.run)
+        self._import_worker.completed.connect(self._import_completed)
+        self._import_worker.failed.connect(self._import_failed)
+        self._import_worker.completed.connect(self._import_thread.quit)
+        self._import_worker.failed.connect(self._import_thread.quit)
+        self._import_thread.finished.connect(self._import_worker.deleteLater)
+        self._import_thread.finished.connect(self._import_thread.deleteLater)
+        self._import_thread.finished.connect(self._import_finished)
+        self.status.setText(f"Copying {len(incoming)} image(s) in the background…")
+        self._sync_buttons()
+        self._import_thread.start()
+
+    def _import_completed(self, report):
+        if self._import_folder_id and report.copied:
+            self._pending_auto_ids.add(self._import_folder_id)
+        self.status.setText(
+            f"Copied {len(report.copied)} image(s), skipped {len(report.skipped)}. "
+            "Their source files are unchanged. Indexing follows automatically."
+        )
+        if report.skipped:
+            QMessageBox.information(self, "Import Details", "\n".join(report.skipped[:10]))
+
+    def _import_failed(self, message):
+        if self._import_folder_id:
+            self._pending_auto_ids.add(self._import_folder_id)
+        self.status.setText("Import was interrupted; any successfully copied files will be indexed.")
+        self._error(message)
+
+    def _import_finished(self):
+        folder_id = self._import_folder_id
+        self._import_thread = None
+        self._import_worker = None
+        self._import_folder_id = None
+        self._sync_buttons()
+        if folder_id and not self.auto_scan_checkbox.isChecked():
+            self._pending_auto_ids.discard(folder_id)
+            self._start_scan(None, folder_ids=(folder_id,), automatic=False)
+        elif self._pending_auto_ids:
+            self._auto_scan_timer.start(200)
+
+    def _find_duplicates(self):
+        if self._duplicates_thread is not None:
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                records = catalog.list_all_images()
+        except (OSError, ValueError) as error:
+            self._error(str(error))
+            return
+        self._duplicates_thread = QThread(self)
+        self._duplicates_worker = DuplicateScanWorker(
+            [record.path for record in records if record.available]
+        )
+        self._duplicates_worker.moveToThread(self._duplicates_thread)
+        self._duplicates_thread.started.connect(self._duplicates_worker.run)
+        self._duplicates_worker.completed.connect(self._duplicates_completed)
+        self._duplicates_worker.failed.connect(self._duplicates_failed)
+        self._duplicates_worker.completed.connect(self._duplicates_thread.quit)
+        self._duplicates_worker.failed.connect(self._duplicates_thread.quit)
+        self._duplicates_thread.finished.connect(self._duplicates_worker.deleteLater)
+        self._duplicates_thread.finished.connect(self._duplicates_thread.deleteLater)
+        self._duplicates_thread.finished.connect(self._duplicates_finished)
+        self.status.setText(f"Comparing {len(records)} indexed images by content in the background…")
+        self._sync_buttons()
+        self._duplicates_thread.start()
+
+    def _duplicates_completed(self, report):
+        groups = report.groups
+        self.status.setText(
+            f"Duplicate check completed: {len(groups)} exact duplicate group(s). "
+            "Nothing was deleted or moved."
+        )
+        details = "\n\n".join(
+            f"Set {index} ({len(group)} copies):\n" + "\n".join(str(path) for path in group)
+            for index, group in enumerate(groups, 1)
+        )
+        if report.unreadable:
+            details += "\n\nUnavailable files:\n" + "\n".join(report.unreadable[:30])
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Exact duplicate wallpapers")
+        dialog.setText(
+            f"Found {len(groups)} group(s) of byte-identical images. "
+            "Only images with matching size are hashed. Original files are untouched."
+        )
+        if details:
+            dialog.setDetailedText(details)
+        dialog.exec()
+
+    def _duplicates_failed(self, message):
+        self._error(f"Duplicate check failed: {message}")
+
+    def _duplicates_finished(self):
+        self._duplicates_thread = None
+        self._duplicates_worker = None
+        self._sync_buttons()
+
+    def _image_context_menu(self, view, pos):
+        clicked = view.itemAt(pos)
+        if clicked is None:
+            return
+        if view is self.images:
+            identity_cell = self.images.item(clicked.row(), 0)
+            image_id = identity_cell.data(USER_ROLE) if identity_cell else None
+        else:
+            image_id = clicked.data(USER_ROLE)
+        image = next((r for r in self._image_records if r.id == image_id), None)
+        if image is None or not image.available or not image.path.is_file():
+            return
+        from wallpaper_orchestrator.engine import SUPPORTED
+        if image.path.suffix.lower() not in SUPPORTED:
+            menu = QMenu(self)
+            menu.addAction("This format is indexed but not supported as a direct wallpaper").setEnabled(False)
+            menu.exec(view.viewport().mapToGlobal(pos))
+            return
+        host = self.window()
+        monitors = getattr(host, "monitors", [])
+        roles = {mid: role for role, mid in getattr(host, "mapping", {}).items()}
+        menu = QMenu(self)
+        compatible = [monitor for monitor in monitors
+                      if monitor.orientation == image.orientation]
+        submenu = menu if len(compatible) == 1 else menu.addMenu("Apply to display")
+        for monitor in compatible:
+            label = roles.get(monitor.device_id, monitor.orientation)
+            prefix = "Apply to " if len(compatible) == 1 else ""
+            action = submenu.addAction(f"{prefix}{label} ({monitor.width} × {monitor.height})")
+            action.triggered.connect(
+                lambda _checked=False, mid=monitor.device_id, iid=image.id:
+                    self._apply_image_to_monitor(iid, mid)
+            )
+        if not submenu.actions():
+            submenu.addAction("No display with a matching orientation").setEnabled(False)
+        menu.exec(view.viewport().mapToGlobal(pos))
+
+    def _apply_image_to_monitor(self, image_id, device_id):
+        """Explicit one-off application; do not alter folder subscriptions."""
+        image = next((record for record in self._image_records if record.id == image_id), None)
+        if image is None or not image.path.is_file():
+            QMessageBox.warning(self, "Apply Wallpaper", "This image is no longer available.")
+            return
+        try:
+            from wallpaper_orchestrator.engine import apply_plan
+            from wallpaper_orchestrator.models import Wallpaper
+            from wallpaper_orchestrator.profiles import default_profile, load_profiles, save_profiles
+            current = load_profiles()
+            wallpaper = Wallpaper(image.path, image.orientation, frozenset())
+            apply_plan({device_id: wallpaper}, {device_id: device_id})
+            profile = current.setdefault(device_id, default_profile())
+            profile["last_image"] = str(image.path)
+            if profile.get("mode") == "fixed":
+                profile["image"] = str(image.path)
+            save_profiles(current)
+            host = self.window()
+            if hasattr(host, "profiles"):
+                host.profiles = current
+            self.status.setText(f"Applied {image.path.name} to one display.")
+        except Exception as error:
+            self._error(f"Wallpaper could not be applied: {error}")
+
+    def _assign_tag(self) -> None:
+        image_ids, tag_id = self.selected_image_ids(), self.tag_choice.currentData()
+        if not image_ids or not tag_id:
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                catalog.tag_images(image_ids, [tag_id])
+            for image_id in image_ids:
+                self._tag_ids_by_image.setdefault(image_id, set()).add(tag_id)
             self._image_changed()
         except Exception as error:
             self._error(str(error))
 
     def _remove_image_tag(self) -> None:
-        image_id, item = self.selected_image_id(), self.image_tags.currentItem()
-        if not image_id or item is None:
+        image_ids, item = self.selected_image_ids(), self.image_tags.currentItem()
+        if not image_ids or item is None:
             return
         try:
             with WallpaperCatalog() as catalog:
-                catalog.untag_image(image_id, item.data(USER_ROLE))
+                catalog.untag_images(image_ids, [item.data(USER_ROLE)])
+            for image_id in image_ids:
+                self._tag_ids_by_image.setdefault(image_id, set()).discard(item.data(USER_ROLE))
             self._image_changed()
         except Exception as error:
             self._error(str(error))
@@ -671,9 +1122,9 @@ class LibraryPanel(QWidget):
         try:
             with WallpaperCatalog() as catalog:
                 tag = catalog.create_tag(name)
-                image_id = self.selected_image_id()
-                if image_id:
-                    catalog.tag_image(image_id, tag.id)
+                image_ids = self.selected_image_ids()
+                if image_ids:
+                    catalog.tag_images(image_ids, [tag.id])
             self.refresh_collections(self.selected_collection_id())
             index = self.tag_choice.findData(tag.id)
             if index >= 0:
@@ -781,7 +1232,8 @@ class LibraryPanel(QWidget):
             self.status.setText("Auto-scan paused. Manual Scan buttons still work.")
 
     def _perform_automatic_scan(self) -> None:
-        if not self.auto_scan_checkbox.isChecked() or self.scan_running():
+        if (not self.auto_scan_checkbox.isChecked() or self.scan_running()
+                or self._import_thread is not None):
             return
         if not self._pending_auto_ids:
             return
@@ -798,7 +1250,14 @@ class LibraryPanel(QWidget):
         self._watch_stop.set()
         self._watch_wakeup.set()
         self._auto_scan_timer.stop()
+        self._thumb_timer.stop()
         self._watch_thread.join(timeout=3.0)
+        # Qt must not destroy a QThread while its worker is still hashing or
+        # copying user files. Complete in-flight, already confirmed actions.
+        for thread in (self._import_thread, self._duplicates_thread):
+            if thread is not None:
+                thread.quit()
+                thread.wait()
 
     def _start_scan(
         self, collection_id: str | None, *,
