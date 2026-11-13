@@ -25,6 +25,10 @@ if "wallpaper_orchestrator.platforms.windows" not in sys.modules:
 
 from wallpaper_orchestrator import engine
 from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.library_tools import import_images_to_collection
+from wallpaper_orchestrator.automation import (
+    AutomationConfig, resolve_interval_targets, set_interval,
+)
 from wallpaper_orchestrator.profiles import default_profile, load_profiles, save_profiles
 
 
@@ -95,6 +99,30 @@ class CollectionSelectionTests(unittest.TestCase):
             )
         self.assertEqual(assignments["portrait-id"].path, image.path)
         self.assertIn("Nature", assignments["portrait-id"].themes)
+
+    def test_folderless_import_is_eligible_for_monitor_selection_and_interval(self):
+        collection = self.catalog.create_collection("Favourite Wallpapers")
+        path = self.root / "favourite.png"
+        Image.new("RGB", (800, 1200), "blue").save(path)
+        report = import_images_to_collection(self.catalog, collection.id, [path])
+        self.assertEqual(report.imported, (path,))
+        self.assertEqual(self.catalog.list_folder_links(collection.id), [])
+        self.catalog.set_monitor_collections("portrait-id", [collection.id])
+        profile = self.profile()
+        config = set_interval(AutomationConfig(background_enabled=True),
+                              ["portrait-id"], 60, now=0)
+        targets = resolve_interval_targets(list(config.rules), {"portrait-id"},
+                                           {"portrait-id": profile})
+        self.assertEqual(targets.device_ids, frozenset({"portrait-id"}))
+        monitors = [SimpleNamespace(device_id="portrait-id", orientation="portrait")]
+        with patch.object(engine, "discover_monitors", return_value=monitors), \
+             patch.object(engine, "get_monitor_wallpaper", return_value=None), \
+             patch.object(engine, "_theme_limits", return_value={}):
+            assignments, _ = engine.create_profile_plan(
+                None, {"portrait-id": profile}, selected_device_ids=targets.device_ids,
+            )
+        self.assertEqual(assignments["portrait-id"].path, path)
+        self.assertIn("Favourite Wallpapers", assignments["portrait-id"].themes)
 
     def test_theme_limit_respected_between_collections(self):
         catholic = self.catalog.create_collection("Catholic Art")

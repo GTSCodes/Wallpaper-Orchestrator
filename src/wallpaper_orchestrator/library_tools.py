@@ -7,7 +7,10 @@ from pathlib import Path
 import shutil
 from typing import Iterable
 
-from wallpaper_orchestrator.indexer import SUPPORTED_EXTENSIONS
+from PIL import Image, UnidentifiedImageError
+
+from wallpaper_orchestrator.catalog import WallpaperCatalog
+from wallpaper_orchestrator.indexer import SUPPORTED_EXTENSIONS, read_image_metadata
 
 
 @dataclass(frozen=True)
@@ -17,9 +20,42 @@ class ImportReport:
 
 
 @dataclass(frozen=True)
+class ManualImportReport:
+    imported: tuple[Path, ...]
+    skipped: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class DuplicateReport:
     groups: tuple[tuple[Path, ...], ...]
     unreadable: tuple[str, ...]
+
+
+def import_images_to_collection(
+    catalog: WallpaperCatalog, collection_id: str, sources: Iterable[Path | str],
+) -> ManualImportReport:
+    """Reference verified images in a collection without copying their files.
+
+    An ordinary collection does not require a linked folder.  Existing
+    catalogue IDs and manual memberships are reused on repeated imports.
+    Each failed image is reported without preventing other valid imports.
+    """
+    if not any(item.id == collection_id for item in catalog.list_collections()):
+        raise KeyError(f"Unknown collection: {collection_id}")
+    imported, skipped = [], []
+    for path in dict.fromkeys(Path(source) for source in sources):
+        try:
+            metadata = read_image_metadata(path)
+            record = catalog.upsert_image(
+                metadata.path, width=metadata.width, height=metadata.height,
+                size_bytes=metadata.size_bytes, modified_ns=metadata.modified_ns,
+            )
+            catalog.add_image_to_collection(collection_id, record.id)
+            imported.append(record.path)
+        except (OSError, ValueError, SyntaxError, UnidentifiedImageError,
+                Image.DecompressionBombError) as error:
+            skipped.append(f"{path.name}: {error}")
+    return ManualImportReport(tuple(imported), tuple(skipped))
 
 
 def copy_images_into_folder(sources: Iterable[Path | str], destination: Path | str) -> ImportReport:

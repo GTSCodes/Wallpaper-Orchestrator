@@ -15,7 +15,9 @@ from wallpaper_orchestrator.intelligence import (
     SmartCollection, load_smart_collections, save_smart_collections,
 )
 from wallpaper_orchestrator.intelligence_view import SmartEditor
-from wallpaper_orchestrator.library_tools import copy_images_into_folder, find_exact_duplicates
+from wallpaper_orchestrator.library_tools import (
+    copy_images_into_folder, find_exact_duplicates, import_images_to_collection,
+)
 
 
 ROLE = Qt.ItemDataRole.UserRole
@@ -294,5 +296,26 @@ class ImportWorker(QObject):
     def run(self):
         try:
             self.completed.emit(copy_images_into_folder(self.paths, self.destination))
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
+class ManualImportWorker(QObject):
+    """Index manual collection members using a separate SQLite connection."""
+
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, paths, collection_id):
+        super().__init__()
+        self.paths = tuple(paths)
+        self.collection_id = collection_id
+
+    @Slot()
+    def run(self):
+        try:
+            with WallpaperCatalog() as catalog:
+                report = import_images_to_collection(catalog, self.collection_id, self.paths)
+            self.completed.emit(report)
         except Exception as error:
             self.failed.emit(str(error))
