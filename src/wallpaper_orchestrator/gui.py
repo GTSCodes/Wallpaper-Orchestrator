@@ -440,6 +440,11 @@ class WallpaperWindow(QMainWindow):
         # Reopenable guided setup; avoid reorganising the existing advanced UI.
         setup_menu = self.menuBar().addMenu("Setup")
         setup_menu.addAction("Run setup wizard…", self.run_setup_wizard)
+        setup_menu.addSeparator()
+        setup_menu.addAction("Save current wallpapers as restore point…",
+                             self._save_restore_point)
+        setup_menu.addAction("Restore previous wallpapers and pause automations…",
+                             self._restore_previous_wallpapers)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
@@ -710,6 +715,75 @@ class WallpaperWindow(QMainWindow):
     def run_setup_wizard(self):
         from wallpaper_orchestrator.setup_wizard import FirstRunWizard
         FirstRunWizard(self).exec()
+
+    def _save_restore_point(self):
+        """Explicit replacement of the safety baseline is a user-only action."""
+        from wallpaper_orchestrator.restore_points import (
+            capture_wallpapers, read_restore_point,
+        )
+        try:
+            present = read_restore_point() is not None
+            explanation = (
+                "Replace your saved restore point with the wallpapers "
+                "currently shown on all connected displays?\n\n"
+                "The old restore point will be lost. No wallpaper files "
+                "will be changed."
+                if present else
+                "Save the current wallpapers on all connected displays "
+                "as your restore point?\n\nNo wallpaper files will be changed."
+            )
+            result = QMessageBox.question(
+                self, "Save wallpaper restore point", explanation,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return
+            capture_wallpapers(discover_monitors, get_monitor_wallpaper,
+                               overwrite=present)
+            QMessageBox.information(self, "Restore point saved",
+                                    "Current wallpaper images saved for recovery.")
+        except Exception as error:
+            QMessageBox.critical(self, "Restore point", str(error))
+
+    def _restore_previous_wallpapers(self):
+        """Pause scheduling before returning connected displays to baseline."""
+        from wallpaper_orchestrator.restore_points import (
+            pause_for_restore, read_restore_point, restore_wallpapers,
+        )
+        try:
+            saved = read_restore_point()
+            if saved is None:
+                QMessageBox.information(
+                    self, "No restore point",
+                    "No previous wallpapers have been saved yet. "
+                    "You can save the current desktop from the Setup menu."
+                )
+                return
+            result = QMessageBox.question(
+                self, "Restore previous wallpapers",
+                "Stop background automation, pause ALL interval, daily and "
+                "seasonal automations, and restore the saved wallpaper images "
+                "to connected displays?\n\n"
+                "Your collections, rules and original image files will "
+                "remain unchanged. You can resume automation later.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return
+            pause_for_restore()
+            restored, skipped = restore_wallpapers(
+                saved, (monitor.device_id for monitor in discover_monitors()),
+                set_monitor_wallpaper,
+            )
+            self.refresh_wallpaper_previews(force=True)
+            result_text = f"Restored {len(restored)} display(s). Automation is paused."
+            if skipped:
+                result_text += "\n\nSkipped:\n" + "\n".join(skipped)
+            QMessageBox.information(self, "Wallpaper restoration", result_text)
+        except Exception as error:
+            QMessageBox.critical(self, "Wallpaper restoration", str(error))
 
     def _watch_screen(self, screen):
         """Watch movement, resizing and rotation of an existing Qt screen."""

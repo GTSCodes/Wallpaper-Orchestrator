@@ -21,7 +21,7 @@ from wallpaper_orchestrator.catalog_models import (
 from wallpaper_orchestrator.intelligence import load_smart_collections, save_smart_collections
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def default_catalog_path() -> Path:
@@ -115,6 +115,23 @@ class WallpaperCatalog:
                 PRAGMA user_version = 2;
                 COMMIT;
             """)
+            version = 2
+
+        if version == 2:
+            # Exclusions are collection-specific. They never delete the file or
+            # its indexed metadata, and survive automatic linked-folder scans.
+            self._db.executescript("""
+                BEGIN IMMEDIATE;
+                CREATE TABLE collection_exclusions (
+                    collection_id TEXT NOT NULL REFERENCES collections(id)
+                        ON DELETE CASCADE,
+                    image_id TEXT NOT NULL REFERENCES images(id)
+                        ON DELETE CASCADE,
+                    PRIMARY KEY (collection_id, image_id)
+                );
+                PRAGMA user_version = 3;
+                COMMIT;
+            """)
             return
 
         # Fresh catalogue. Other versions above were rejected explicitly.
@@ -170,6 +187,13 @@ class WallpaperCatalog:
                 PRIMARY KEY (collection_id, image_id)
             );
             -- Separate from legacy profiles.json until source-mode integration.
+            CREATE TABLE collection_exclusions (
+                collection_id TEXT NOT NULL REFERENCES collections(id)
+                    ON DELETE CASCADE,
+                image_id TEXT NOT NULL REFERENCES images(id)
+                    ON DELETE CASCADE,
+                PRIMARY KEY (collection_id, image_id)
+            );
             CREATE TABLE monitor_collections (
                 monitor_id TEXT NOT NULL,
                 collection_id TEXT NOT NULL REFERENCES collections(id)
@@ -189,7 +213,7 @@ class WallpaperCatalog:
                 ON manual_collection_images(image_id);
             CREATE INDEX idx_monitor_collections_collection
                 ON monitor_collections(collection_id);
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             COMMIT;
         """)
 
@@ -532,24 +556,101 @@ class WallpaperCatalog:
                 "UPDATE images SET available = 0 WHERE id = ?",
                 [(image_id,) for image_id in invalid | unavailable],
             )
+            # Clean up exclusions only after a completed scan of an available
+            # folder, and only when the original image file no longer exists.
+            # This also handles a manual drop removed before its first scan.
+            if prune_missing:
+                link = self.get_folder_link(folder_link_id)
+                for row in self._db.execute("""
+                    SELECT ex.image_id, i.path FROM collection_exclusions AS ex
+                    JOIN images AS i ON i.id = ex.image_id
+                    WHERE ex.collection_id = ?
+                """, (link.collection_id,)).fetchall():
+                    if (self._path_belongs_to_link(Path(row["path"]), link.path,
+                                                   link.recursive)
+                            and not Path(row["path"]).exists()):
+                        self._db.execute("""
+                            DELETE FROM collection_exclusions
+                            WHERE collection_id = ? AND image_id = ?
+                        """, (link.collection_id, row["image_id"]))
         return added, updated, len(removed)
 
+    @staticmethod
+    def _path_belongs_to_link(image_path: Path, folder_path: Path,
+                              recursive: bool) -> bool:
+        try:
+            subpath = image_path.relative_to(folder_path)
+        except ValueError:
+            return False
+        return bool(subpath.parts) and (recursive or len(subpath.parts) == 1)
+
+    def is_linked_collection_image(self, collection_id: str, image_id: str) -> bool:
+        """Whether a linked folder supplies or would discover this image."""
+        if self._db.execute("""
+            SELECT 1 FROM folder_images AS fi
+            JOIN folder_links AS fl ON fl.id = fi.folder_link_id
+            WHERE fl.collection_id = ? AND fi.image_id = ? LIMIT 1
+        """, (collection_id, image_id)).fetchone():
+            return True
+        # An image dragged in from a linked folder before the first scan must
+        # still count as linked, even though folder_images is not populated yet.
+        image = self.get_image(image_id)
+        return any(
+            self._path_belongs_to_link(image.path, link.path, link.recursive)
+            for link in self.list_folder_links(collection_id)
+        )
+
     def add_image_to_collection(self, collection_id: str, image_id: str) -> None:
-        """Manual membership survives unlinking a folder."""
+        """Explicit import also restores an image previously excluded here."""
         with self._db:
             self._db.execute(
                 "INSERT OR IGNORE INTO manual_collection_images VALUES (?, ?)",
                 (collection_id, image_id),
             )
+            self._db.execute("""
+                DELETE FROM collection_exclusions
+                WHERE collection_id = ? AND image_id = ?
+            """, (collection_id, image_id))
 
-    def remove_image_from_collection(self, collection_id: str, image_id: str) -> None:
-        """Remove only manual membership; linked folders still supply images."""
+    def remove_image_from_collection(self, collection_id: str, image_id: str) -> bool:
+        """Remove a membership without ever deleting the user's image file.
+
+        Returns True only when a linked-folder membership must be excluded
+        from future scans; manual-only images need no persistent exclusion.
+        """
+        linked = self.is_linked_collection_image(collection_id, image_id)
         with self._db:
-            self._db.execute(
-                """DELETE FROM manual_collection_images
-                   WHERE collection_id = ? AND image_id = ?""",
-                (collection_id, image_id),
-            )
+            self._db.execute("""
+                DELETE FROM manual_collection_images
+                WHERE collection_id = ? AND image_id = ?
+            """, (collection_id, image_id))
+            if linked:
+                self._db.execute("""
+                    INSERT OR IGNORE INTO collection_exclusions VALUES (?, ?)
+                """, (collection_id, image_id))
+            else:
+                self._db.execute("""
+                    DELETE FROM collection_exclusions
+                    WHERE collection_id = ? AND image_id = ?
+                """, (collection_id, image_id))
+        return linked
+
+    def list_excluded_images(self, collection_id: str) -> list[ImageRecord]:
+        """List only exclusions belonging to this one collection."""
+        rows = self._db.execute("""
+            SELECT i.* FROM images AS i
+            JOIN collection_exclusions AS ex ON ex.image_id = i.id
+            WHERE ex.collection_id = ? ORDER BY i.path_key
+        """, (collection_id,))
+        return [_image_from_row(row) for row in rows]
+
+    def restore_excluded_image(self, collection_id: str, image_id: str) -> None:
+        """Restore visibility; linked folder membership remains unchanged."""
+        with self._db:
+            self._db.execute("""
+                DELETE FROM collection_exclusions
+                WHERE collection_id = ? AND image_id = ?
+            """, (collection_id, image_id))
 
     def list_collection_images(self, collection_id: str) -> list[ImageRecord]:
         """Return each image once, even with overlapping folders and manual links."""
@@ -579,7 +680,16 @@ class WallpaperCatalog:
                 record = _image_from_row(row)
                 if spec.matches(tags_by_image.get(record.id, set())):
                     records[record.id] = record
-        return sorted(records.values(), key=lambda record: str(record.path).casefold())
+        excluded_ids = {
+            row["image_id"] for row in self._db.execute(
+                "SELECT image_id FROM collection_exclusions WHERE collection_id = ?",
+                (collection_id,),
+            )
+        }
+        return sorted(
+            (record for record in records.values() if record.id not in excluded_ids),
+            key=lambda record: str(record.path).casefold(),
+        )
 
     def list_image_collections(self, image_id: str) -> list[Collection]:
         rows = self._db.execute(
@@ -601,7 +711,16 @@ class WallpaperCatalog:
                 spec = specs.get(collection.id)
                 if spec and spec.matches(tags):
                     collections[collection.id] = collection
-        return sorted(collections.values(), key=lambda collection: collection.name.casefold())
+        excluded = {
+            row["collection_id"] for row in self._db.execute(
+                "SELECT collection_id FROM collection_exclusions WHERE image_id = ?",
+                (image_id,),
+            )
+        }
+        return sorted(
+            (collection for collection in collections.values() if collection.id not in excluded),
+            key=lambda collection: collection.name.casefold(),
+        )
 
     def create_tag(self, name: str) -> Tag:
         display, key = _normalised_name(name)

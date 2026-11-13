@@ -127,6 +127,11 @@ def set_monitor_wallpaper(
             "This wallpaper format is not currently supported."
         )
 
+    # On the very first wallpaper change, capture the user's existing
+    # images for every connected display. Never overwrite this automatically.
+    from wallpaper_orchestrator.restore_points import capture_wallpapers
+    capture_wallpapers(discover_monitors, get_monitor_wallpaper)
+
     desktop = CreateObject(
         "{C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}",
         interface=IDesktopWallpaper,

@@ -41,10 +41,11 @@ class LibraryC6Tests(unittest.TestCase):
         with closing(sqlite3.connect(path)) as db:
             with db:
                 db.execute("DROP TABLE folder_tag_defaults")
+                db.execute("DROP TABLE collection_exclusions")
                 db.execute("PRAGMA user_version = 1")
         with WallpaperCatalog(path) as upgraded:
             self.assertIn(collection, upgraded.list_collections())
-            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(upgraded._db.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_default_tags_apply_to_new_and_existing_folder_images(self):
         collection = self.catalog.create_collection("Art")
