@@ -244,6 +244,8 @@ class LibraryPanel(QWidget):
         self.smart_action = self.tools_menu.addAction("Manage smart collections…")
         self.tools_menu.addSeparator()
         self.duplicates_action = self.tools_menu.addAction("Find exact duplicates…")
+        self.tools_menu.addSeparator()
+        self.excluded_action = self.tools_menu.addAction("Excluded images…")
         self.tools_button.setMenu(self.tools_menu)
         search_row.addWidget(self.tools_button)
         right_layout.addLayout(search_row)
@@ -330,6 +332,11 @@ class LibraryPanel(QWidget):
         tag_management.addWidget(self.rename_tag_button)
         tag_management.addWidget(self.delete_tag_button)
         detail_side.addLayout(tag_management)
+        self.remove_image_button = QPushButton("Remove selected from collection…")
+        self.remove_image_button.setToolTip(
+            "Keep original image files. Linked-folder items become reversible exclusions."
+        )
+        detail_side.addWidget(self.remove_image_button)
         details.addLayout(detail_side, 1)
         right_layout.addLayout(details, 1)
         splitter.addWidget(right)
@@ -385,6 +392,8 @@ class LibraryPanel(QWidget):
         self.folder_defaults_action.triggered.connect(self._configure_folder_defaults)
         self.smart_action.triggered.connect(self._open_smart_collections)
         self.duplicates_action.triggered.connect(self._find_duplicates)
+        self.excluded_action.triggered.connect(self._show_excluded_images)
+        self.remove_image_button.clicked.connect(self._remove_selected_images)
         self.images.files_dropped.connect(self._import_dropped_images)
         self.grid.files_dropped.connect(self._import_dropped_images)
         for view in (self.images, self.grid):
@@ -727,6 +736,96 @@ class LibraryPanel(QWidget):
         self.folder_defaults_action.setEnabled(has_folder and not busy)
         self.duplicates_action.setEnabled(self._duplicates_thread is None)
         self.import_action.setEnabled(not busy)
+        self.remove_image_button.setEnabled(has_collection and has_image and not busy)
+        self.excluded_action.setEnabled(has_collection and not busy)
+
+    def _remove_selected_images(self) -> None:
+        collection_id = self.selected_collection_id()
+        ids = self.selected_image_ids()
+        if not collection_id or not ids:
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                linked = sum(catalog.is_linked_collection_image(collection_id, iid)
+                             for iid in ids)
+            explanation = (
+                f"Remove {len(ids)} selected image(s) from this collection?\n\n"
+                "No original files will be deleted.\n"
+            )
+            if linked:
+                explanation += (
+                    f"\n{linked} image(s) belong to linked folders and will be "
+                    "placed in Excluded images. They will stay hidden after "
+                    "folder rescans and can be restored later."
+                )
+            else:
+                explanation += (
+                    "\nThese images were added manually; their collection "
+                    "membership will be removed without creating exclusions."
+                )
+            answer = QMessageBox.question(
+                self, "Remove from collection", explanation,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            with WallpaperCatalog() as catalog:
+                for image_id in ids:
+                    catalog.remove_image_from_collection(collection_id, image_id)
+            self._collection_changed()
+            self.status.setText(f"Removed {len(ids)} image(s) without deleting files.")
+        except Exception as error:
+            self._error(str(error))
+
+    def _show_excluded_images(self) -> None:
+        collection_id = self.selected_collection_id()
+        if not collection_id:
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                records = catalog.list_excluded_images(collection_id)
+        except Exception as error:
+            self._error(str(error))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Excluded images")
+        dialog.resize(650, 400)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            "These linked-folder images are hidden only from this collection. "
+            "Their original files are untouched."
+        ))
+        entries = QListWidget()
+        entries.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        for image in records:
+            item = QListWidgetItem(f"{image.path.name}  —  {image.path}")
+            item.setData(USER_ROLE, image.id)
+            entries.addItem(item)
+        layout.addWidget(entries)
+        row = QHBoxLayout()
+        restore_button = QPushButton("Restore selected")
+        restore_button.setEnabled(bool(records))
+        close_button = QPushButton("Close")
+        row.addWidget(restore_button)
+        row.addStretch(1)
+        row.addWidget(close_button)
+        layout.addLayout(row)
+        close_button.clicked.connect(dialog.reject)
+        restore_button.clicked.connect(dialog.accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = [item.data(USER_ROLE) for item in entries.selectedItems()]
+        if not selected:
+            return
+        try:
+            with WallpaperCatalog() as catalog:
+                for image_id in selected:
+                    catalog.restore_excluded_image(collection_id, image_id)
+            self._collection_changed()
+            self.status.setText(f"Restored {len(selected)} excluded image(s).")
+        except Exception as error:
+            self._error(str(error))
 
     def _add_collection(self) -> None:
         name, accepted = QInputDialog.getText(self, "New Collection", "Name:")
