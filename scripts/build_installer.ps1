@@ -1,4 +1,4 @@
-<# C8.2 installer compile. Requires the portable folder and Inno Setup 6. #>
+<# C8.2 installer compile. Requires the portable folder and Inno Setup 6 or 7. #>
 param([string]$IsccPath = '')
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +9,8 @@ if (-not (Test-Path $bundle)) {
 }
 if (-not $IsccPath) {
     $candidates = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+        "${env:ProgramFiles}\Inno Setup 7\ISCC.exe",
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
         "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
     )
@@ -16,7 +18,7 @@ if (-not $IsccPath) {
         Select-Object -First 1
 }
 if (-not $IsccPath -or -not (Test-Path $IsccPath)) {
-    throw 'Install Inno Setup 6 or pass -IsccPath with the absolute ISCC.exe path.'
+    throw 'Install Inno Setup 6 or 7 or pass -IsccPath with the absolute ISCC.exe path.'
 }
 & $IsccPath (Join-Path $repo 'installer\WallpaperOrchestrator.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Inno Setup build failed.' }

@@ -1,50 +1,93 @@
-name: C8 Windows portable build
+name: Windows build and installer validation
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
   push:
-    branches:
-      - 'feature/c8-*'
+    branches: [main, 'fix/c8.3-*', 'feat/c8.3-*']
 
 permissions:
   contents: read
 
 jobs:
-  portable:
+  windows-package:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.13'
           cache: pip
 
-      - name: Build portable application
-        shell: pwsh
-        run: ./scripts/build_windows.ps1
+      - name: Install application and build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
+          python -m pip install -e '.[gui,dev]' 'Nuitka>=2.7,<5' 'ordered-set>=4.1' 'zstandard>=0.22'
+          if ($LASTEXITCODE -ne 0) { throw 'Installing dependencies failed' }
 
-      - name: Check bundled imports without accessing user configuration
-        shell: pwsh
+      - name: Test source code
+        run: |
+          python -m unittest discover -s tests -q
+          if ($LASTEXITCODE -ne 0) { throw 'Source test suite failed' }
+
+      - name: Build standalone executable
+        run: ./scripts/build_windows.ps1 -SkipInstall -SkipTests
+
+      - name: Validate packaged executable
         run: |
           $exe = Join-Path $PWD 'dist\WallpaperOrchestrator\WallpaperOrchestrator.exe'
-          $result = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
-          if ($result.ExitCode -ne 0) {
-            throw "Portable executable smoke test failed with code $($result.ExitCode)."
-          }
+          if (-not (Test-Path $exe)) { throw 'Standalone executable missing' }
+          $process = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Packaged self-test failed: $($process.ExitCode)" }
 
-      - name: Create download ZIP
-        shell: pwsh
+      - name: Install Inno Setup compiler
         run: |
-          Compress-Archive -Path 'dist\WallpaperOrchestrator' -DestinationPath 'dist\WallpaperOrchestrator-C8.1-Windows.zip'
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Installing Inno Setup failed' }
 
-      - name: Upload portable ZIP
+      - name: Build Windows installer
+        run: ./scripts/build_installer.ps1
+
+      - name: Package versioned artifacts and SHA-256 checksums
+        run: |
+          $content = Get-Content 'pyproject.toml' -Raw
+          if ($content -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'Missing project version' }
+          $version = $Matches[1]
+          $iss = Get-Content 'installer\WallpaperOrchestrator.iss' -Raw
+          if ($iss -notmatch '(?m)^#define MyAppVersion "([^"]+)"') { throw 'Missing installer version' }
+          if ($Matches[1] -ne $version) { throw 'Python and installer versions disagree' }
+          $portable = "dist\WallpaperOrchestrator-$version-Windows-portable.zip"
+          $setup = "dist\WallpaperOrchestrator-$version-Windows-Setup.exe"
+          Compress-Archive -Path 'dist\WallpaperOrchestrator' -DestinationPath $portable
+          Copy-Item -LiteralPath 'dist\WallpaperOrchestrator-Setup.exe' -Destination $setup
+          $checksums = @($portable, $setup) | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $([System.IO.Path]::GetFileName($_))"
+          }
+          $checksums | Set-Content -Path "dist\WallpaperOrchestrator-$version-SHA256SUMS.txt" -Encoding ascii
+          $files = @($portable, $setup, "dist\WallpaperOrchestrator-$version-SHA256SUMS.txt")
+          foreach ($file in $files) {
+            if (-not (Test-Path $file)) { throw "Artifact missing: $file" }
+            Write-Host "Created $file"
+          }
+          "ARTIFACT_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Upload validated release candidates
         uses: actions/upload-artifact@v4
         with:
-          name: WallpaperOrchestrator-C8.1-Windows
-          path: dist/WallpaperOrchestrator-C8.1-Windows.zip
+          name: WallpaperOrchestrator-Windows-${{ env.ARTIFACT_VERSION }}
+          path: |
+            dist/WallpaperOrchestrator-*-Windows-portable.zip
+            dist/WallpaperOrchestrator-*-Windows-Setup.exe
+            dist/WallpaperOrchestrator-*-SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
