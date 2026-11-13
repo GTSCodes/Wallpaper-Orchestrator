@@ -84,7 +84,9 @@ class RuntimeModeTests(unittest.TestCase):
                  patch.object(background, "_record_launch_attempt") as log:
                 background.start_agent()
             self.assertEqual(spawn.call_args.args[0], [str(exe), "--background-agent"])
-            self.assertEqual(spawn.call_args.kwargs["cwd"], str(exe.parent))
+            # Windows may expose the temp folder as an 8.3 short path or as
+            # its long name. Verify the same directory, not the spelling.
+            self.assertTrue(Path(spawn.call_args.kwargs["cwd"]).samefile(exe.parent))
             log.assert_called_once()
             self.assertIn("created child PID 1234", log.call_args.kwargs["result"])
 
