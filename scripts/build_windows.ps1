@@ -48,11 +48,25 @@ try {
         [System.Text.UTF8Encoding]::new($false)
     )
 
+    # The PEP 440 beta version maps to Windows' four-number file version.
+    # Example: 0.8.0b3 -> 0.8.0.3 (the GUI keeps the readable beta string).
+    $version = python scripts/check_version.py
+    if ($LASTEXITCODE -ne 0) { throw 'Package/installer version check failed.' }
+    if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)b(\d+)$') {
+        throw "Unsupported Windows beta version: $version"
+    }
+    $windowsVersion = '{0}.{1}.{2}.{3}' -f $Matches[1], $Matches[2], $Matches[3], $Matches[4]
+
     $compileOptions = @(
         '--mode=standalone',
         '--enable-plugin=pyside6',
         '--include-package=wallpaper_orchestrator',
         '--windows-console-mode=disable',
+        "--file-version=$windowsVersion",
+        "--product-version=$windowsVersion",
+        '--product-name=Wallpaper Orchestrator',
+        '--company-name=GTSCodes',
+        '--file-description=Wallpaper Orchestrator desktop and background agent',
         '--output-dir=build',
         '--output-filename=WallpaperOrchestrator.exe',
         "--windows-icon-from-ico=$icon",

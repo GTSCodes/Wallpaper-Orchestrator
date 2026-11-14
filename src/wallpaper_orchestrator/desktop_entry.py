@@ -90,6 +90,21 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:
             _record_startup_failure("self-test", error)
             return 1
+    if args == ["--quit-gui"]:
+        try:
+            from wallpaper_orchestrator.gui_single_instance import request_gui_exit
+            return 0 if request_gui_exit() else 1
+        except Exception as error:
+            _record_startup_failure("gui-shutdown", error)
+            return 1
+    if args == ["--backup-user-data"]:
+        try:
+            from wallpaper_orchestrator.state_backup import create_backup
+            create_backup()
+            return 0
+        except Exception as error:
+            _record_startup_failure("backup", error)
+            return 1
     if args == ["--stop-agent"]:
         try:
             from wallpaper_orchestrator.background import stop_agent
@@ -126,6 +141,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     raise SystemExit(
         "Usage: WallpaperOrchestrator.exe "
-        "[--background-agent | --self-test | --stop-agent | "
-        "--repair-startup | --disable-background]"
+        "[--background-agent | --self-test | --stop-agent | --quit-gui | "
+        "--backup-user-data | --repair-startup | --disable-background]"
     )

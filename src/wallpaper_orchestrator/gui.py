@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from wallpaper_orchestrator import __version__
 from wallpaper_orchestrator.engine import apply_plan, create_profile_plan
 from wallpaper_orchestrator.automation import (
     load_automation, matching_rule, overlapping_intervals, remove_interval,
@@ -421,7 +422,7 @@ class WallpaperWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Wallpaper Orchestrator")
+        self.setWindowTitle(f"Wallpaper Orchestrator — v{__version__}")
         self.resize(1030, 700)
 
         # Keep the existing global library preference from older GUI versions.
@@ -461,6 +462,10 @@ class WallpaperWindow(QMainWindow):
                              self._restore_first_wallpapers)
         setup_menu.addAction("Restore custom restore point and pause automations…",
                              self._restore_previous_wallpapers)
+
+        help_menu = self.menuBar().addMenu("Help")
+        help_menu.addAction("About Wallpaper Orchestrator…", self.show_about)
+        help_menu.addAction("Export redacted diagnostics…", self.export_support_diagnostics)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
@@ -1538,6 +1543,50 @@ class WallpaperWindow(QMainWindow):
             self.status.setText(f"Shuffle all failed: {error}")
             raise
 
+    def show_about(self):
+        QMessageBox.information(
+            self, "About Wallpaper Orchestrator",
+            f"Wallpaper Orchestrator v{__version__}\n\n"
+            "Multi-monitor wallpaper organisation and background automation."
+        )
+
+    def export_support_diagnostics(self):
+        """Explicit opt-in export, with private paths redacted."""
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Wallpaper Orchestrator diagnostics",
+            str(Path.home() / "WallpaperOrchestrator-diagnostics.zip"),
+            "ZIP archive (*.zip)",
+        )
+        if not filename:
+            return
+        try:
+            from wallpaper_orchestrator.diagnostics import export_diagnostics
+            result = export_diagnostics(filename)
+            QMessageBox.information(
+                self, "Diagnostics saved",
+                f"Saved to {result}. Review the archive before sharing it."
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Diagnostics export failed", str(error))
+
+    def restore_from_tray(self):
+        """Bring a hidden or minimised GUI forward on a second launch."""
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def close_for_upgrade(self):
+        """Cooperatively exit, waiting for an in-progress library scan."""
+        self._tray_exit_requested = True
+        if self.library_panel.scan_running():
+            QTimer.singleShot(500, self.close_for_upgrade)
+            return
+        self.close()
+        QApplication.instance().quit()
+
     def closeEvent(self, event):
         """Window X hides to tray; explicit Exit stops GUI, never the agent."""
         if (self._tray_controller is not None and
@@ -1558,14 +1607,24 @@ class WallpaperWindow(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv)
-    window = WallpaperWindow()
-    from wallpaper_orchestrator.tray import WallpaperTray
-    window._tray_controller = WallpaperTray(window)
-    if window._tray_controller.available:
-        app.setQuitOnLastWindowClosed(False)
-    window.show()
-    return app.exec()
+    from wallpaper_orchestrator.gui_single_instance import GuiInstanceGateway
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    gateway = GuiInstanceGateway()
+    if not gateway.claim():
+        return 0  # The already-running GUI has received SHOW.
+    try:
+        window = WallpaperWindow()
+        gateway.on_show = window.restore_from_tray
+        gateway.on_quit = window.close_for_upgrade
+        from wallpaper_orchestrator.tray import WallpaperTray
+        window._tray_controller = WallpaperTray(window)
+        if window._tray_controller.available:
+            app.setQuitOnLastWindowClosed(False)
+        window.show()
+        return app.exec()
+    finally:
+        gateway.close()
 
 
 if __name__ == "__main__":
