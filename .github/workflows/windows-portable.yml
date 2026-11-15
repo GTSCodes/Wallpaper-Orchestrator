@@ -6,12 +6,15 @@ on:
     branches: [main]
   push:
     branches: [main, 'fix/c8.3-*', 'feat/c8.3-*']
+    tags: ['v*']
 
 permissions:
   contents: read
 
 jobs:
   windows-package:
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
@@ -27,11 +30,22 @@ jobs:
           python-version: '3.13'
           cache: pip
 
+      - name: Validate package and installer versions
+        id: version
+        run: |
+          $version = python scripts/check_version.py
+          if ($LASTEXITCODE -ne 0) { throw 'Package/installer version mismatch' }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            python scripts/check_version.py --tag $env:GITHUB_REF_NAME
+            if ($LASTEXITCODE -ne 0) { throw 'Release tag does not match the package version' }
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
       - name: Install application and build dependencies
         run: |
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
-          python -m pip install -e '.[gui,dev]' 'Nuitka>=2.7,<5' 'ordered-set>=4.1' 'zstandard>=0.22'
+          python -m pip install -c constraints/windows-ci.txt -e '.[gui,dev]' 'Nuitka>=2.7,<5' 'ordered-set>=4.1' 'zstandard>=0.22'
           if ($LASTEXITCODE -ne 0) { throw 'Installing dependencies failed' }
 
       - name: Test source code
@@ -49,6 +63,24 @@ jobs:
           $process = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Packaged self-test failed: $($process.ExitCode)" }
 
+      - name: Exercise headless agent entry point with isolated Windows data
+        run: |
+          $exe = Join-Path $PWD 'dist\WallpaperOrchestrator\WallpaperOrchestrator.exe'
+          $isolated = Join-Path $env:RUNNER_TEMP 'wallpaper-agent-ci'
+          New-Item -ItemType Directory -Path $isolated -Force | Out-Null
+          $original = $env:LOCALAPPDATA
+          try {
+            $env:LOCALAPPDATA = $isolated
+            $process = Start-Process -FilePath $exe -ArgumentList '--background-agent' -PassThru -Wait
+            if ($process.ExitCode -ne 0) { throw "Isolated headless agent exited $($process.ExitCode)" }
+            $status = Join-Path $isolated 'WallpaperOrchestrator\background-status.json'
+            if (-not (Test-Path $status)) { throw 'No isolated agent status was written' }
+            $report = Get-Content $status -Raw | ConvertFrom-Json
+            if ($report.running -ne $false) { throw 'CI agent did not stop cleanly' }
+          } finally {
+            $env:LOCALAPPDATA = $original
+          }
+
       - name: Install Inno Setup compiler
         run: |
           choco install innosetup --yes --no-progress
@@ -59,12 +91,7 @@ jobs:
 
       - name: Package versioned artifacts and SHA-256 checksums
         run: |
-          $content = Get-Content 'pyproject.toml' -Raw
-          if ($content -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'Missing project version' }
-          $version = $Matches[1]
-          $iss = Get-Content 'installer\WallpaperOrchestrator.iss' -Raw
-          if ($iss -notmatch '(?m)^#define MyAppVersion "([^"]+)"') { throw 'Missing installer version' }
-          if ($Matches[1] -ne $version) { throw 'Python and installer versions disagree' }
+          $version = '${{ steps.version.outputs.value }}'
           $portable = "dist\WallpaperOrchestrator-$version-Windows-portable.zip"
           $setup = "dist\WallpaperOrchestrator-$version-Windows-Setup.exe"
           Compress-Archive -Path 'dist\WallpaperOrchestrator' -DestinationPath $portable
@@ -91,3 +118,30 @@ jobs:
             dist/WallpaperOrchestrator-*-SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
+
+  publish-prerelease:
+    # Only an explicitly pushed vX.Y.Z tag can publish; PR and main builds
+    # upload run artifacts but cannot create a GitHub Release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the validated Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: WallpaperOrchestrator-Windows-${{ needs.windows-package.outputs.version }}
+          path: artifacts
+
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.windows-package.outputs.version }}
+        run: |
+          test "$GITHUB_REF_NAME" = "v$VERSION"
+          test -f "artifacts/WallpaperOrchestrator-$VERSION-SHA256SUMS.txt"
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --verify-tag --prerelease --title "Wallpaper Orchestrator $GITHUB_REF_NAME" \
+            --generate-notes

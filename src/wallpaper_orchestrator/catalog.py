@@ -102,6 +102,14 @@ class WallpaperCatalog:
         if version == SCHEMA_VERSION:
             return
 
+        # A WAL-consistent catalogue + JSON snapshot is required BEFORE any
+        # schema migration, even when users launch a portable/source build.
+        # No backup is needed for a brand-new, empty database.
+        if version in (1, 2):
+            from wallpaper_orchestrator.state_backup import create_backup
+            create_backup(root=self.path.parent, catalog_path=self.path,
+                          include_qsettings=False)
+
         if version == 1:
             # C6 additive migration. Original collection, image and tag IDs
             # are preserved; no image files or existing associations change.
