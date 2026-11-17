@@ -5,7 +5,7 @@ Use collections, tags, linked folders, independent display assignments, shuffle
 intervals and seasonal rules. Wallpaper changes can continue in a separate
 background agent after the main window closes.
 
-## Install on Windows (no Python needed)
+## Install on Windows
 
 1. Open [Releases](https://github.com/GTSCodes/Wallpaper-Orchestrator/releases)
    and download the latest **Windows-Setup.exe** from the release assets.
