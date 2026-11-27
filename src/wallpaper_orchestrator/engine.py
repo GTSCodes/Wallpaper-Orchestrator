@@ -45,7 +45,7 @@ def _theme_limits() -> dict[str, int]:
 
 def create_plan(folder: Path):
     """Original CLI-compatible plan: change all mapped active monitors."""
-    detected = discover_monitors()
+    detected = list({m.device_id: m for m in discover_monitors()}.values())
     if not detected:
         raise ValueError("No active monitors detected.")
 
@@ -277,7 +277,7 @@ def create_profile_plan(
     Returned keys are device IDs, so a friendly-name change does not affect
     selections. This is separate from the legacy CLI's role-keyed `create_plan`.
     """
-    detected = discover_monitors()
+    detected = list({m.device_id: m for m in discover_monitors()}.values())
     if not detected:
         raise ValueError("No active monitors detected.")
 
