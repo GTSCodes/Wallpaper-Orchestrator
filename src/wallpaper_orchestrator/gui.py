@@ -1186,7 +1186,7 @@ class WallpaperWindow(QMainWindow):
             QMessageBox.critical(self, "Selection Rules", str(error))
 
     def toggle_select_all(self):
-        select = len(self.selected_device_ids) != len(self.monitors)
+        select = len(self.selected_device_ids) != len(self.monitor_items)
         self.scene.blockSignals(True)
         try:
             for item in self.monitor_items.values():
@@ -1197,8 +1197,8 @@ class WallpaperWindow(QMainWindow):
 
     def monitor_selected(self):
         self.selected_device_ids = [
-            monitor.device_id for monitor in self.monitors
-            if self.monitor_items[monitor.device_id].isSelected()
+            device_id for device_id, item in self.monitor_items.items()
+            if item.isSelected()
         ]
         if self.monitors:
             self.status.clear()
@@ -1209,7 +1209,7 @@ class WallpaperWindow(QMainWindow):
         for item in self.monitor_items.values():
             item.refresh_appearance()
         self.select_all_button.setText(
-            "Clear selection" if count == len(self.monitors) and count else "Select all"
+            "Clear selection" if count == len(self.monitor_items) and count else "Select all"
         )
 
         # Keep the panel present so the monitor diagram never jumps in size.

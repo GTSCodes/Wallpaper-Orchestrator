@@ -68,6 +68,7 @@ def discover_monitors() -> list[DetectedMonitor]:
     )
 
     monitors = []
+    seen_ids = set()
 
     count = desktop.GetMonitorDevicePathCount()
 
@@ -77,6 +78,8 @@ def discover_monitors() -> list[DetectedMonitor]:
         device_id = desktop.GetMonitorDevicePathAt(index)
         
         print(f"Checking monitor entry {index + 1}...")
+        if not device_id or device_id in seen_ids:
+            continue
 
         try:
             rect = desktop.GetMonitorRECT(device_id)
@@ -95,6 +98,7 @@ def discover_monitors() -> list[DetectedMonitor]:
         if width <= 0 or height <= 0:
             continue
 
+        seen_ids.add(device_id)
         monitors.append(
             DetectedMonitor(
                 device_id=device_id,
